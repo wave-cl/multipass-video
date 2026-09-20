@@ -72,7 +72,7 @@ struct Args {
 
     /// File holding the viewer key. Set, every page and stream needs it
     /// (entered once per device at /login); unset, anyone can watch.
-    /// Created (0600, ten random lowercase characters) if absent.
+    /// Created (0600, five random lowercase characters) if absent.
     #[arg(long, env = "MULTIPASS_VIEWER_KEY_FILE")]
     viewer_key_file: Option<PathBuf>,
 }
@@ -138,6 +138,8 @@ struct Inner {
     admin_token: String,
     /// The viewer key and the cookie value that proves it (its SHA-256, hex).
     viewer: Option<(String, String)>,
+    /// Held across the delay on a failed login: one guess at a time, server-wide.
+    login_failures: tokio::sync::Mutex<()>,
     state: Mutex<Persisted>,
     /// Carries the version; SSE subscribers wake on it and re-read the state.
     notify: watch::Sender<u64>,
@@ -230,8 +232,10 @@ fn load_state(path: &Path) -> Persisted {
 }
 
 /// Read a secret from a file, or mint one into it (0600). The admin token
-/// is 32 random bytes as hex; the viewer key is ten lowercase characters,
-/// because it gets typed on a TV remote.
+/// is 32 random bytes as hex; the viewer key is five lowercase characters,
+/// because it gets typed on a TV remote. Five is about 29 million
+/// possibilities; failed logins are served one at a time with a delay, so
+/// guessing them takes months.
 fn load_or_create_secret(path: &Path, what: &str, short: bool) -> std::io::Result<String> {
     if let Ok(s) = std::fs::read_to_string(path) {
         let s = s.trim().to_string();
@@ -243,7 +247,7 @@ fn load_or_create_secret(path: &Path, what: &str, short: bool) -> std::io::Resul
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let token: String = if short {
         const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789"; // no 0/o/1/l/i
-        bytes[..10]
+        bytes[..5]
             .iter()
             .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
             .collect()
@@ -320,6 +324,7 @@ async fn login_post(State(app): State<App>, Form(form): Form<LoginForm>) -> Resp
             format!("{VIEWER_COOKIE}={cookie}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax");
         ([(header::SET_COOKIE, set)], Redirect::to("/")).into_response()
     } else {
+        let _one_at_a_time = app.login_failures.lock().await;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         warn!("viewer login refused");
         (
@@ -498,6 +503,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_file: args.state_file,
         admin_token,
         viewer,
+        login_failures: Default::default(),
         state: Mutex::new(state),
         notify,
     });
@@ -554,6 +560,7 @@ mod tests {
             state_file: dir.join("state.json"),
             admin_token: "admin".into(),
             viewer: viewer_key.map(|k| (k.to_string(), cookie_value(k))),
+            login_failures: Default::default(),
             state: Mutex::new(Persisted::default()),
             notify,
         });
@@ -631,6 +638,28 @@ mod tests {
         assert_eq!(
             call(&app, with("mp_viewer=deadbeef")).await.0,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_logins_are_served_one_at_a_time() {
+        let app = test_app(Some("abcde"));
+        let login = || {
+            Request::post("/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body("key=zzzzz".into())
+                .unwrap()
+        };
+        let t0 = std::time::Instant::now();
+        let (a, b) = tokio::join!(call(&app, login()), call(&app, login()));
+        assert_eq!(
+            (a.0, b.0),
+            (StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED)
+        );
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(1000),
+            "{:?}",
+            t0.elapsed()
         );
     }
 
