@@ -69,8 +69,10 @@ function syncClock() {
 
 // --- trace ----------------------------------------------------------------
 // Opened with ?trace, the viewer reports what its player does to the
-// server's log, so a TV can be read from wherever the server is.
-var TRACE = /[?&]trace/.test(location.search);
+// server's log, so a TV can be read from wherever the server is. TV
+// browsers trace without being asked: they are the ones that differ, and
+// typing a query string on a remote is the step that never happens.
+var TRACE = /[?&]trace/.test(location.search) || /Tizen|SMART-TV|SmartTV|Web0S|NetCast|VIDAA|HbbTV/i.test(navigator.userAgent);
 var traceId = Math.random().toString(36).slice(2, 8), traceBuf = [];
 function trace(m) {
   if (!TRACE) return;
