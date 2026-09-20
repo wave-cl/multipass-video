@@ -1,0 +1,220 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # A tag push is the normal trigger. This is the way back in when it does not
+  # fire -- Actions has more than once created no run at all for a pushed tag,
+  # and re-cutting the tag is a worse remedy than being able to ask.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and release, e.g. v0.1.0'
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Three builds, every one native: GitHub gives arm64 Linux runners, so no
+  # cross toolchain is needed and each artifact is built on the machine it is
+  # for. No Intel macOS build, as with sigil: slowest runner, nobody runs it.
+  # ---------------------------------------------------------------------------
+  build:
+    strategy:
+      # One platform failing should not hide whether the other two work.
+      fail-fast: false
+      matrix:
+        include:
+          # **The oldest Ubuntu GitHub still runs**, deliberately. A binary
+          # built against glibc 2.35 runs on every glibc since; one built on
+          # 24.04 (2.39) refuses to start on a machine a year older. The guard
+          # below reads the ceiling back off the binary, so a runner change
+          # cannot raise it in silence.
+          - artifact: x86_64-linux-gnu
+            os: ubuntu-22.04
+            machine: x86_64
+          - artifact: aarch64-linux-gnu
+            os: ubuntu-22.04-arm
+            machine: aarch64
+          - artifact: aarch64-apple-darwin
+            os: macos-latest
+            machine: arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # A dispatch can name anything, including a branch, and a run that built
+      # `main` would publish a release called `main`.
+      - name: Check it is a version tag
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          case "${VERSION}" in
+            v[0-9]*) ;;
+            *) echo "refusing to release '${VERSION}': not a version tag" >&2; exit 1 ;;
+          esac
+
+      # A runner label is a promise about a machine, and the promise is what
+      # names the file. So ask the machine.
+      - name: Check the runner is the architecture it is named for
+        run: |
+          got="$(uname -m)"
+          [ "$got" = "${{ matrix.machine }}" ] || {
+            echo "::error::${{ matrix.os }} reports $got, expected ${{ matrix.machine }}" >&2
+            exit 1
+          }
+          echo "$got, as expected"
+
+      # The tag, whether it came from the push or from the person dispatching,
+      # so a manual release cannot quietly ship a branch.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      # `--version` on the binary is what an operator reads, and it comes
+      # from Cargo.toml, not the tag. A tag cut before the bump ships a v0.2.0
+      # that calls itself 0.1.0.
+      - name: Check the tag is Cargo.toml's version
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          crate="v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          [ "$crate" = "$VERSION" ] || {
+            echo "::error::tag is $VERSION but Cargo.toml says $crate -- bump it, retag" >&2
+            exit 1
+          }
+          echo "$crate"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # **Read from main, never saved here.** A cache saved by a tag's run is
+      # visible only to that tag. ci.yml's `warm` job builds this profile on
+      # these runners on every push to main under this key; `save-if: false`
+      # keeps tag runs from filling the quota with caches nothing can read.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.os }}
+          save-if: false
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Check the binary runs and says its version
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          out="$(target/release/multipass-video --version)"
+          echo "$out"
+          [ "$out" = "multipass-video ${VERSION#v}" ] || { echo "::error::unexpected --version output" >&2; exit 1; }
+
+      # The glibc a binary needs is the newest symbol version it imports, set
+      # by the runner it was built on, so it is read back off the binary and
+      # compared with what the README promises. 2.35 is Ubuntu 22.04 and
+      # Debian 12.
+      - name: Check the glibc the binary needs
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          need="$(objdump -T target/release/multipass-video | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)"
+          echo "newest glibc symbol version needed: $need"
+          if [ "$(printf '%s\n2.35\n' "$need" | sort -V | tail -1)" != "2.35" ]; then
+            echo "::error::the binary needs glibc $need, newer than the 2.35 the README promises -- was it built on a newer runner?"
+            exit 1
+          fi
+
+      # And the architecture of the binary itself, which is the claim the
+      # filename makes.
+      - name: Check the binary is the architecture it is named for
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            arch="$(lipo -archs target/release/multipass-video)"
+          else
+            arch="$(readelf -h target/release/multipass-video | awk -F: '/Machine/ {print $2}' | xargs)"
+            case "$arch" in
+              *X86-64*) arch=x86_64 ;;
+              *AArch64*) arch=aarch64 ;;
+            esac
+          fi
+          [ "$arch" = "${{ matrix.machine }}" ] || {
+            echo "::error::binary is $arch, and this artefact is named ${{ matrix.machine }}" >&2
+            exit 1
+          }
+          echo "binary is $arch"
+
+      - name: Collect
+        shell: bash
+        run: |
+          set -eu
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          NAME="multipass-video-${VERSION}-${{ matrix.artifact }}"
+          mkdir -p dist stage
+          cp target/release/multipass-video README.md stage/
+          tar -czf "dist/${NAME}.tar.gz" -C stage .
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multipass-video-${{ matrix.artifact }}
+          path: dist/*
+
+  # ---------------------------------------------------------------------------
+  # Publish -- but only if all three platforms actually produced their file.
+  # `needs` stops this when a build fails; it does not catch a build that
+  # succeeded while producing nothing, which would publish a release that
+  # looks complete and is missing an architecture.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Every build artifact must be present
+        run: |
+          set -eu
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          missing=0
+          for want in \
+            "multipass-video-${VERSION}-x86_64-linux-gnu.tar.gz" \
+            "multipass-video-${VERSION}-aarch64-linux-gnu.tar.gz" \
+            "multipass-video-${VERSION}-aarch64-apple-darwin.tar.gz"; do
+            test -s "dist/$want" || { echo "::error::missing $want"; missing=1; }
+          done
+          [ "$missing" = 0 ]
+          # Three and only three builds: a stray file here would be published.
+          # The checksum list is added after the count, and is the fourth.
+          n=$(ls dist | wc -l)
+          test "$n" -eq 3 || { echo "::error::dist holds $n files, not 3"; ls -l dist; exit 1; }
+          (cd dist && sha256sum * | tee SHA256SUMS)
+
+      - name: Notes
+        run: |
+          cat > notes.md <<'NOTES'
+          Schedule a video file on disk to play for every viewer in sync.
+
+          ## Which file
+
+          | | |
+          |---|---|
+          | Linux, x86_64 | `x86_64-linux-gnu.tar.gz` (needs glibc ≥ 2.35: Ubuntu 22.04, Debian 12, or newer) |
+          | Linux, aarch64 | `aarch64-linux-gnu.tar.gz` |
+          | macOS, Apple silicon | `aarch64-apple-darwin.tar.gz` (unsigned: `xattr -d com.apple.quarantine multipass-video` after unpacking) |
+
+          Each tarball is the bare binary and the README. Run it with
+          `--media-dir` pointing at your videos; see the README for the rest.
+          `SHA256SUMS` lists the digest of each.
+          NOTES
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          # Named explicitly, because a dispatched run's ref is not the tag.
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          body_path: notes.md
+          generate_release_notes: true
+          files: dist/*

@@ -20,6 +20,16 @@ Viewers therefore agree with the server, not with each other, so a late
 joiner lands in the right place and nobody waits for anybody. Measured on
 localhost: two tabs within ~3 ms of each other; drift settles at 15–30 ms.
 
+## Install
+
+Releases carry a tarball per platform — Linux x86_64 and aarch64 (built
+against glibc 2.35: Ubuntu 22.04, Debian 12, or anything newer) and macOS
+on Apple silicon — each holding the binary and this README. Or build it:
+
+```bash
+cargo install --path .
+```
+
 ## Run
 
 ```bash

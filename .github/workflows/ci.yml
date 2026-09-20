@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# One run per branch. A superseded run proves nothing and costs a runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Formatting, lints and the tests. No system dependencies: the server links
+  # nothing but libc, which is also why one platform is enough here.
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test
+
+  # ---------------------------------------------------------------------------
+  # The release cache, kept warm. A cache saved by a tag's release run is
+  # visible only to that tag, so a release would start cold every time. A
+  # tag's run *may* read a cache saved on main, so this builds the release
+  # profile on release.yml's own runners, on every push to main, under the
+  # key release.yml reads.
+  # ---------------------------------------------------------------------------
+  warm:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.os }}
+          save-if: true
+      - name: Build the release profile
+        run: cargo build --release
