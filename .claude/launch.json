@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "multipass",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "--", "--listen", "127.0.0.1:8080"],
+      "port": 8080
+    }
+  ]
+}

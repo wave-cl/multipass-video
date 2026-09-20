@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>multipass</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#eee;font:15px system-ui,sans-serif;overflow:hidden}
+  #video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+  #overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(0,0,0,.65);text-align:center;padding:16px}
+  #overlay h1{font-size:clamp(20px,4vw,32px);font-weight:600;margin:0}
+  #overlay p{margin:0;opacity:.75;font-variant-numeric:tabular-nums}
+  button{font:inherit;padding:10px 18px;border-radius:8px;border:0;background:#fff;color:#000;cursor:pointer}
+  #unmute{position:absolute;left:12px;bottom:12px;background:rgba(255,255,255,.9)}
+  #hud{position:absolute;right:12px;bottom:12px;font:12px ui-monospace,Menlo,monospace;opacity:.45;background:rgba(0,0,0,.6);padding:4px 8px;border-radius:4px;white-space:pre}
+  .hidden{display:none!important}
+</style>
+</head>
+<body>
+<video id="video" playsinline preload="auto"></video>
+<div id="overlay"><h1 id="title">Connecting…</h1><p id="sub"></p><button id="join" class="hidden">Join</button></div>
+<button id="unmute" class="hidden">Unmute</button>
+<div id="hud"></div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const video = $('video');
+
+// --- what the server says -------------------------------------------------
+let schedule = null;      // {file, start_ms, loop} or null
+let version = -1;
+let duration = NaN;       // of the loaded file, seconds
+let loadError = false;
+
+// --- clock ----------------------------------------------------------------
+// offset = server clock − local clock, in ms, from the lowest-RTT sample
+// of each round; the round's RTT is shown in the HUD so a bad estimate is visible.
+let offset = 0, offsetRtt = NaN;
+const serverNow = () => Date.now() + offset;
+
+async function syncClock() {
+  let best = {rtt: Infinity, offset: 0}, last = null;
+  for (let i = 0; i < 3; i++) {
+    const t0 = Date.now();
+    let s;
+    try { s = await (await fetch('/api/state', {cache: 'no-store'})).json(); }
+    catch { continue; }
+    const t1 = Date.now(), rtt = t1 - t0;
+    if (rtt < best.rtt) best = {rtt, offset: s.server_now_ms - (t0 + rtt / 2)};
+    last = s;
+  }
+  if (last) { offset = best.offset; offsetRtt = best.rtt; apply(last); }
+}
+
+// --- schedule changes -----------------------------------------------------
+function apply(s) {
+  if (s.version === version) return;
+  version = s.version;
+  schedule = s.schedule;
+  duration = NaN; loadError = false;
+  if (schedule) {
+    video.src = '/media/' + encodeURIComponent(schedule.file);
+    video.loop = schedule.loop;   // the element wraps by itself; we only correct
+    video.load();
+  } else {
+    video.removeAttribute('src');
+    video.load();
+  }
+}
+
+video.addEventListener('loadedmetadata', () => { duration = video.duration; });
+video.addEventListener('error', () => { loadError = true; });
+
+const es = new EventSource('/api/events');
+es.addEventListener('state', e => apply(JSON.parse(e.data)));
+
+// --- playback control -----------------------------------------------------
+// The user's gesture is needed once for unmuted playback. We try muted
+// autoplay first; if even that is refused we show a Join button.
+let needGesture = false, playPending = false;
+
+function ensurePlaying() {
+  if (!video.paused || playPending || needGesture) return;
+  playPending = true;
+  video.play().then(() => { playPending = false; })
+    .catch(() => {
+      playPending = false;
+      if (!video.muted) { video.muted = true; ensurePlaying(); }   // retry muted
+      else needGesture = true;
+    });
+}
+$('join').onclick = () => { needGesture = false; video.muted = false; video.play().catch(() => {}); };
+$('unmute').onclick = () => { video.muted = false; };
+
+// Where the schedule says we should be right now.
+function target() {
+  if (!schedule) return {state: 'idle'};
+  const t = (serverNow() - schedule.start_ms) / 1000;
+  if (t < 0) return {state: 'waiting', in: -t};
+  if (loadError) return {state: 'error'};
+  if (isNaN(duration)) return {state: 'loading'};
+  if (schedule.loop) return {state: 'playing', pos: t % duration};
+  if (t >= duration) return {state: 'ended'};
+  return {state: 'playing', pos: t};
+}
+
+// Drift with the shortest way round the loop, so the wrap does not read as
+// a whole-duration error.
+function wrapDrift(d) {
+  if (!schedule.loop || !duration) return d;
+  return ((d + duration / 2) % duration + duration) % duration - duration / 2;
+}
+
+let lastDrift = 0, seeks = 0;
+const SEEK_ABOVE = 0.5;     // s: jump
+const NUDGE_ABOVE = 0.05;   // s: bend playbackRate
+const MAX_NUDGE = 0.08;     // ±8 % speed
+
+function tick() {
+  const t = target();
+  let hudDrift = '';
+  switch (t.state) {
+    case 'idle':    pause(); show('Nothing scheduled', 'Waiting for the administrator'); break;
+    case 'waiting': pause(); show('Starting in ' + fmt(t.in), schedule.file); break;
+    case 'loading': pause(); show('Loading…', schedule.file); break;
+    case 'error':   pause(); show('Cannot play this file', schedule.file + ' — is it H.264/AAC MP4 or WebM?'); break;
+    case 'ended':   pause(); show('Stream ended', schedule.file); break;
+    case 'playing': {
+      ensurePlaying();
+      if (needGesture) { show('Live', schedule.file, true); break; }
+      hide();
+      if (!video.seeking && video.readyState >= 2) {
+        const drift = wrapDrift(video.currentTime - t.pos);   // + means ahead
+        lastDrift = drift;
+        if (Math.abs(drift) > SEEK_ABOVE) {
+          video.currentTime = t.pos;
+          video.playbackRate = 1; seeks++;
+        } else if (Math.abs(drift) > NUDGE_ABOVE) {
+          video.playbackRate = 1 - Math.max(-MAX_NUDGE, Math.min(MAX_NUDGE, drift));
+        } else {
+          video.playbackRate = 1;
+        }
+      }
+      hudDrift = `${fmt(t.pos)} / ${fmt(duration)}${schedule.loop ? ' ↻' : ''}  drift ${(lastDrift * 1000).toFixed(0).padStart(5)}ms  rate ${video.playbackRate.toFixed(2)}  seeks ${seeks}\n`;
+      break;
+    }
+  }
+  $('unmute').classList.toggle('hidden', !(t.state === 'playing' && video.muted && !needGesture));
+  $('hud').textContent = hudDrift + `clock offset ${offset.toFixed(0)}ms  rtt ${isNaN(offsetRtt) ? '?' : offsetRtt + 'ms'}`;
+}
+
+function pause() { if (!video.paused) video.pause(); }
+function show(title, sub, join) {
+  $('overlay').classList.remove('hidden');
+  $('title').textContent = title; $('sub').textContent = sub || '';
+  $('join').classList.toggle('hidden', !join);
+}
+function hide() { $('overlay').classList.add('hidden'); }
+function fmt(s) {
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
+  const mm = String(m).padStart(2, '0'), ss = String(sec).padStart(2, '0');
+  return h ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}
+
+syncClock();
+setInterval(syncClock, 30000);
+setInterval(tick, 250);
+</script>
+</body>
+</html>

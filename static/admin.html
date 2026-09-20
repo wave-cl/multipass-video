@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>multipass admin</title>
+<style>
+  body{margin:0;padding:24px 16px;background:#111;color:#eee;font:15px system-ui,sans-serif;max-width:640px;margin-inline:auto}
+  h1{font-size:20px;margin:0 0 20px}
+  section{background:#1b1b1b;border-radius:10px;padding:16px;margin-bottom:16px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;opacity:.6;margin:0 0 12px}
+  label{display:block;margin:8px 0}
+  input[type=password],input[type=datetime-local],select{font:inherit;padding:8px;border-radius:6px;border:1px solid #333;background:#000;color:#eee;width:100%;box-sizing:border-box}
+  input[type=datetime-local]{width:auto}
+  button{font:inherit;padding:9px 16px;border-radius:8px;border:0;background:#fff;color:#000;cursor:pointer;margin-right:8px}
+  button.quiet{background:#333;color:#eee}
+  #status{font-variant-numeric:tabular-nums;white-space:pre-line}
+  #msg{margin-top:10px;min-height:1.4em}
+  #msg.err{color:#f66}
+  small{opacity:.6}
+</style>
+</head>
+<body>
+<h1>multipass admin</h1>
+
+<section>
+  <h2>Token</h2>
+  <label>Admin token <input id="token" type="password" autocomplete="off" placeholder="contents of the admin-token file"></label>
+  <small>Kept in this tab's sessionStorage only.</small>
+</section>
+
+<section>
+  <h2>Now playing</h2>
+  <div id="status">Connecting…</div>
+  <div style="margin-top:12px"><button id="stop" class="quiet">Stop</button> <a href="/" target="_blank" style="color:#9cf">open viewer ↗</a></div>
+</section>
+
+<section>
+  <h2>Schedule</h2>
+  <form id="form">
+    <label>File <select id="file"><option value="">— load files with a token —</option></select></label>
+    <label><input type="radio" name="when" value="now" checked> Start now</label>
+    <label><input type="radio" name="when" value="at"> Start at <input type="datetime-local" id="at" step="1"></label>
+    <label><input type="checkbox" id="loop"> Loop</label>
+    <button type="submit">Start</button>
+  </form>
+  <div id="msg"></div>
+</section>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const tokenEl = $('token');
+tokenEl.value = sessionStorage.getItem('token') || '';
+
+function auth() { return {'Authorization': 'Bearer ' + tokenEl.value.trim()}; }
+function say(text, err) { $('msg').textContent = text; $('msg').className = err ? 'err' : ''; }
+
+async function loadFiles() {
+  sessionStorage.setItem('token', tokenEl.value);
+  if (!tokenEl.value.trim()) return;
+  const r = await fetch('/api/files', {headers: auth()});
+  if (!r.ok) { say(r.status === 401 ? 'Token rejected' : 'Could not list files (' + r.status + ')', true); return; }
+  const files = await r.json();
+  const sel = $('file');
+  sel.innerHTML = files.length ? '' : '<option value="">(no playable files in the media directory)</option>';
+  for (const f of files) {
+    const o = document.createElement('option');
+    o.value = f.name; o.textContent = `${f.name}  (${(f.size / 1e6).toFixed(1)} MB)`;
+    sel.appendChild(o);
+  }
+  say(`${files.length} file(s)`);
+}
+tokenEl.addEventListener('change', loadFiles);
+if (tokenEl.value) loadFiles();
+
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const file = $('file').value;
+  if (!file) { say('Pick a file', true); return; }
+  const body = {file, loop: $('loop').checked, start_ms: null};
+  if (document.querySelector('input[name=when]:checked').value === 'at') {
+    const t = new Date($('at').value).getTime();
+    if (isNaN(t)) { say('Pick a start time', true); return; }
+    body.start_ms = t;
+  }
+  const r = await fetch('/api/schedule', {method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  say(r.ok ? 'Scheduled' : `Refused: ${r.status} ${await r.text()}`, !r.ok);
+});
+
+$('stop').onclick = async () => {
+  const r = await fetch('/api/schedule', {method: 'DELETE', headers: auth()});
+  say(r.ok ? 'Stopped' : `Refused: ${r.status} ${await r.text()}`, !r.ok);
+};
+
+// Live status, from the same event stream the viewers use.
+let state = null, offset = 0;
+const es = new EventSource('/api/events');
+es.addEventListener('state', e => { state = JSON.parse(e.data); offset = state.server_now_ms - Date.now(); render(); });
+es.onerror = () => { $('status').textContent = 'Disconnected — reconnecting…'; };
+
+function render() {
+  if (!state) return;
+  const s = state.schedule;
+  if (!s) { $('status').textContent = 'Nothing scheduled.'; return; }
+  const t = (Date.now() + offset - s.start_ms) / 1000;
+  const when = new Date(s.start_ms).toLocaleString();
+  $('status').textContent = t < 0
+    ? `${s.file}\nstarts at ${when} (in ${fmt(-t)})${s.loop ? ', looping' : ''}`
+    : `${s.file}\nstarted ${when}, ${fmt(t)} ago${s.loop ? ', looping' : ''}`;
+}
+setInterval(render, 500);
+
+function fmt(s) {
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
+  return (h ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+}
+</script>
+</body>
+</html>
