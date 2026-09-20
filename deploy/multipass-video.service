@@ -1,0 +1,39 @@
+[Unit]
+Description=multipass-video: scheduled video playback, in sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=multipass
+Group=multipass
+ExecStart=/opt/multipass-video/bin/multipass-video
+WorkingDirectory=/var/lib/multipass-video
+# Token and state live in the working directory; media is read-only.
+Environment=MULTIPASS_LISTEN=127.0.0.1:8080
+Environment=MULTIPASS_MEDIA_DIR=/srv/multipass/media
+Environment=MULTIPASS_ADMIN_TOKEN_FILE=/var/lib/multipass-video/admin-token
+Environment=MULTIPASS_STATE_FILE=/var/lib/multipass-video/state.json
+Environment=RUST_LOG=info,tower_http=warn
+Restart=on-failure
+RestartSec=2
+
+# It reads one directory and writes one; it needs nothing else.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/multipass-video
+ReadOnlyPaths=/srv/multipass/media
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

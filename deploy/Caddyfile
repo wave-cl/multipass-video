@@ -1,0 +1,11 @@
+# Caddy obtains and renews the Let's Encrypt certificate itself. The app
+# listens on loopback only; this is the only way in.
+multipass.video {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080 {
+		# SSE: a proxy that buffers the response would hold every schedule
+		# change until the buffer filled. Caddy flushes by default for
+		# text/event-stream, but say so.
+		flush_interval -1
+	}
+}

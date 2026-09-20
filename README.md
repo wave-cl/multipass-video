@@ -82,3 +82,18 @@ ffmpeg -f lavfi -i testsrc=size=640x360:rate=30 -f lavfi -i sine=frequency=440:s
 - Transcoding / HLS for files browsers cannot play.
 - A playlist — one file at a time.
 - Chat, viewer count, or anything social.
+
+## Deploying
+
+`deploy/` holds a hardened systemd unit and a Caddyfile; Caddy obtains and
+renews the Let's Encrypt certificate itself. `scripts/deploy HOST TAG`
+installs that release on a Debian/Ubuntu host from the GitHub release,
+checked against its `SHA256SUMS`, and is safe to re-run to upgrade:
+
+```bash
+scripts/deploy root@multipass.video v0.1.0
+```
+
+Videos go in `/srv/multipass/media` on the host; the admin token is minted
+on first start at `/var/lib/multipass-video/admin-token` and is never
+printed by the script.

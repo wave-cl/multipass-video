@@ -1,0 +1,60 @@
+#!/bin/sh
+# Install a released multipass-video on a Debian/Ubuntu host behind Caddy.
+#
+#   scripts/deploy root@multipass.video v0.1.0
+#
+# Idempotent: re-run with a newer tag to upgrade. The binary comes from the
+# GitHub release, checked against its SHA256SUMS, and is installed with
+# install(1) rather than cp so a running executable is never overwritten
+# in place. The admin token is minted by the service on first start and is
+# never printed here: read it with
+#   ssh HOST cat /var/lib/multipass-video/admin-token
+set -eu
+host=${1:?host}; tag=${2:?tag}
+repo=wave-cl/multipass-video
+here=$(cd "$(dirname "$0")/.." && pwd)
+
+scp -q "$here/deploy/multipass-video.service" "$here/deploy/Caddyfile" "$host:/tmp/"
+
+ssh "$host" tag="$tag" repo="$repo" 'sh -s' <<'REMOTE'
+set -eu
+arch=$(uname -m)
+case "$arch" in x86_64) a=x86_64-linux-gnu ;; aarch64) a=aarch64-linux-gnu ;; *) echo "no build for $arch" >&2; exit 1 ;; esac
+name="multipass-video-${tag}-${a}.tar.gz"
+base="https://github.com/${repo}/releases/download/${tag}"
+
+if ! id -u multipass >/dev/null 2>&1; then
+  useradd --system --home-dir /var/lib/multipass-video --shell /usr/sbin/nologin multipass
+fi
+install -d -m 755 -o multipass -g multipass /var/lib/multipass-video /srv/multipass/media
+install -d -m 755 /opt/multipass-video/bin
+
+work=$(mktemp -d); cd "$work"
+curl -fsSL -o "$name" "${base}/${name}"
+curl -fsSL -o SHA256SUMS "${base}/SHA256SUMS"
+grep " ${name}\$" SHA256SUMS | sha256sum -c -
+tar -xzf "$name"
+install -m 755 multipass-video /opt/multipass-video/bin/multipass-video
+/opt/multipass-video/bin/multipass-video --version
+cd /; rm -rf "$work"
+
+install -m 644 /tmp/multipass-video.service /etc/systemd/system/multipass-video.service
+rm /tmp/multipass-video.service
+systemctl daemon-reload
+systemctl enable --now multipass-video
+systemctl restart multipass-video
+
+if ! command -v caddy >/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -q && apt-get install -y -q caddy
+fi
+caddy validate --config /tmp/Caddyfile --adapter caddyfile
+install -m 644 /tmp/Caddyfile /etc/caddy/Caddyfile
+rm /tmp/Caddyfile
+systemctl enable --now caddy
+systemctl reload caddy || systemctl restart caddy
+
+sleep 1
+systemctl is-active multipass-video caddy
+curl -fsS http://127.0.0.1:8080/api/state; echo
+REMOTE
