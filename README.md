@@ -37,8 +37,8 @@ API call and byte of media needs a cookie that `/login` sets once per
 device from the key in that file -- five lowercase characters, minted on
 first start, chosen to be typed on a TV remote; failed logins are served
 one at a time with a delay, so guessing one takes months. Without it, anyone with
-the URL can watch. The deploy unit sets it; read the key with
-`ssh HOST cat /var/lib/multipass-video/viewer-key`.
+the URL can watch. The deploy unit leaves it unset; uncomment it there to gate the
+stream, and read the key with `ssh HOST cat /var/lib/multipass-video/viewer-key`.
 
 ## Run
 
