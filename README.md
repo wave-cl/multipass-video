@@ -48,26 +48,36 @@ bearer header.
 
 ## TV browsers
 
-A TV browser (Samsung's Tizen one among them) is not a laptop's: it lands
-a seek on the nearest keyframe rather than the frame asked for, takes a
-moment to get there, and may ignore `playbackRate` altogether. The viewer
-notices each of those from what the player actually does and adapts: a
-seek that lands ahead of the schedule is *held* -- paused on that frame
-until the schedule catches up, which is exact on any player -- one that
-lands behind is stepped forward until it can be held, a rate the player
-ignores is never set again, and the clock's stall after a seek is measured
-and aimed for next time. The HUD names what it found (`keyframe player`,
-`rate ignored`, `stall`), and is legible from a sofa on a screen 1600 px
-or wider.
+A TV browser's player is not a laptop's. Samsung's (Tizen 9, SamsungBrowser
+8 on Chromium 120) was read through the viewer's trace on 2026-09-20:
+its seeks land within 0.3 s every time, but **any `playbackRate` change
+flushes the decoder and restarts from the next keyframe**, `play()` after
+`pause()` does the same, the clock stalls 0.5-1.5 s after a seek, and the
+loop wrap lands anywhere within a second. Corrected the way a laptop is
+corrected -- nudge the rate, pause to wait -- every correction was a hop.
 
-To see what a particular player is doing, open the viewer with `?trace`
-on it: it reports every seek, landing, hold, rate verdict and element
-event to the server's log (`journalctl -u multipass-video -t multipass-video
-| grep viewer`), so a TV can be read from wherever the server is.
+So the viewer checks each kind of correction for whether the player can
+take it, and uses only what it can: a rate change followed at once by
+`waiting` turns the rate off for good; a clock that jumps on resume ends
+holds; a seek-only player is corrected by seeks alone, aimed ahead by the
+measured stall, backing off (3, 6, 12 ... 30 s) until one settles inside
+0.75 s. Samsung's browser starts with rate and holds off. On that TV the
+result is one seek at join, one per loop wrap or so, and a flat drift
+between (2 seeks, 0 holds, 0 rate changes in 67 s; v0.1.5 had 35 + 30 +
+13 in 210 s). The HUD names what it found and is legible from a sofa on
+a screen 1600 px or wider.
 
-The other half is the file: on a keyframe-seeking player the keyframe
-interval bounds how far off a join lands and how long a hold freezes.
-`scripts/transcode` writes one every 2 s.
+To see what any player is doing, open the viewer with `?trace` (TV
+browsers trace without being asked): it reports every seek, landing,
+hold, rate verdict and element event to the server's log, readable with
+`journalctl -u multipass-video | grep viewer`. Read that before
+simulating: the shim written before the trace had the TV's behaviour
+backwards.
+
+The other half is the file: `scripts/transcode` writes a keyframe every
+2 s, which bounds where a seek can land on a player that seeks to
+keyframes. (It was not the cause on the Samsung; a CBR Main-profile
+encode behaved the same.)
 
 ## Files that will play
 
