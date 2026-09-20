@@ -5,15 +5,18 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>multipass</title>
 <style>
+  /* Written for the oldest Chromium a TV browser still ships: no `inset`,
+     no flex `gap`, no `clamp()`. */
   html,body{margin:0;height:100%;background:#000;color:#eee;font:15px system-ui,sans-serif;overflow:hidden}
-  #video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
-  #overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(0,0,0,.65);text-align:center;padding:16px}
-  #overlay h1{font-size:clamp(20px,4vw,32px);font-weight:600;margin:0}
-  #overlay p{margin:0;opacity:.75;font-variant-numeric:tabular-nums}
+  #video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;background:#000}
+  #overlay{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.65);text-align:center;padding:16px}
+  #overlay h1{font-size:28px;font-weight:600;margin:0 0 14px}
+  #overlay p{margin:0 0 14px;opacity:.75;font-variant-numeric:tabular-nums}
   button{font:inherit;padding:10px 18px;border-radius:8px;border:0;background:#fff;color:#000;cursor:pointer}
-  #controls{position:absolute;left:12px;top:12px;display:flex;gap:8px;transition:opacity .3s}
-  #controls button{background:rgba(255,255,255,.9)}
+  #controls{position:absolute;left:12px;top:12px;transition:opacity .3s}
+  #controls button{background:rgba(255,255,255,.9);margin-right:8px}
   #hud{position:absolute;right:12px;bottom:12px;font:12px ui-monospace,Menlo,monospace;opacity:.45;background:rgba(0,0,0,.6);padding:4px 8px;border-radius:4px;white-space:pre;transition:opacity .3s}
+  @media (min-width:1600px){#hud{font-size:22px}#overlay h1{font-size:44px}#overlay p,button{font-size:22px}}
   /* Idle in fullscreen: nothing but the picture. */
   body.idle #controls,body.idle #hud{opacity:0;pointer-events:none}
   body.idle{cursor:none}
@@ -27,33 +30,41 @@
 <div id="hud"></div>
 <script>
 'use strict';
-const $ = id => document.getElementById(id);
-const video = $('video');
+var $ = function (id) { return document.getElementById(id); };
+var video = $('video');
 
 // --- what the server says -------------------------------------------------
-let schedule = null;      // {file, start_ms, loop} or null
-let version = -1;
-let duration = NaN;       // of the loaded file, seconds
-let loadError = false;
+var schedule = null;      // {file, start_ms, loop} or null
+var version = -1;
+var duration = NaN;       // of the loaded file, seconds
+var loadError = false;
 
 // --- clock ----------------------------------------------------------------
-// offset = server clock − local clock, in ms, from the lowest-RTT sample
-// of each round; the round's RTT is shown in the HUD so a bad estimate is visible.
-let offset = 0, offsetRtt = NaN;
-const serverNow = () => Date.now() + offset;
+// offset = server clock − local clock, in ms, from the lowest-RTT sample of
+// each round; the round's RTT is shown in the HUD so a bad estimate is visible.
+var offset = 0, offsetRtt = NaN;
+function serverNow() { return Date.now() + offset; }
 
-async function syncClock() {
-  let best = {rtt: Infinity, offset: 0}, last = null;
-  for (let i = 0; i < 3; i++) {
-    const t0 = Date.now();
-    let s;
-    try { s = await (await fetch('/api/state', {cache: 'no-store'})).json(); }
-    catch { continue; }
-    const t1 = Date.now(), rtt = t1 - t0;
-    if (rtt < best.rtt) best = {rtt, offset: s.server_now_ms - (t0 + rtt / 2)};
-    last = s;
+function sample() {
+  var t0 = Date.now();
+  return fetch('/api/state', {cache: 'no-store'})
+    .then(function (r) { return r.json(); })
+    .then(function (s) { return {s: s, t0: t0, rtt: Date.now() - t0}; })
+    .catch(function () { return null; });
+}
+function syncClock() {
+  var got = [];
+  function finish() {
+    if (!got.length) return;
+    var best = got.reduce(function (a, b) { return b.rtt < a.rtt ? b : a; });
+    offset = best.s.server_now_ms - (best.t0 + best.rtt / 2);
+    offsetRtt = best.rtt;
+    apply(got[got.length - 1].s);
   }
-  if (last) { offset = best.offset; offsetRtt = best.rtt; apply(last); }
+  (function next(i) {
+    if (i >= 3) return finish();
+    sample().then(function (x) { if (x) got.push(x); next(i + 1); });
+  })(0);
 }
 
 // --- schedule changes -----------------------------------------------------
@@ -62,6 +73,7 @@ function apply(s) {
   version = s.version;
   schedule = s.schedule;
   duration = NaN; loadError = false;
+  resetController();
   if (schedule) {
     video.src = '/media/' + encodeURIComponent(schedule.file);
     video.loop = schedule.loop;   // the element wraps by itself; we only correct
@@ -72,60 +84,61 @@ function apply(s) {
   }
 }
 
-video.addEventListener('loadedmetadata', () => { duration = video.duration; });
-video.addEventListener('error', () => { loadError = true; });
+video.addEventListener('loadedmetadata', function () { duration = video.duration; });
+video.addEventListener('error', function () { loadError = true; });
 
-const es = new EventSource('/api/events');
-es.addEventListener('state', e => apply(JSON.parse(e.data)));
+var es = new EventSource('/api/events');
+es.addEventListener('state', function (e) { apply(JSON.parse(e.data)); });
 
-// --- playback control -----------------------------------------------------
+// --- playback: getting it started -----------------------------------------
 // The user's gesture is needed once for unmuted playback. We try muted
 // autoplay first; if even that is refused we show a Join button.
-let needGesture = false, playPending = false;
+var needGesture = false, playPending = false;
 
 function ensurePlaying() {
-  if (!video.paused || playPending || needGesture) return;
+  if (!video.paused || playPending || needGesture || holding) return;
   playPending = true;
-  video.play().then(() => { playPending = false; })
-    .catch(() => {
+  video.play().then(function () { playPending = false; })
+    .catch(function () {
       playPending = false;
       if (!video.muted) { video.muted = true; ensurePlaying(); }   // retry muted
       else needGesture = true;
     });
 }
-$('join').onclick = () => { needGesture = false; video.muted = false; video.play().catch(() => {}); };
-$('unmute').onclick = () => { video.muted = false; };
+$('join').onclick = function () { needGesture = false; video.muted = false; video.play().catch(function () {}); };
+$('unmute').onclick = function () { video.muted = false; };
 
 // --- fullscreen -----------------------------------------------------------
 // The whole page, not the element, so the buttons and HUD stay reachable.
 // iPhone Safari has no page fullscreen; the video's own is the fallback.
 function toggleFullscreen() {
   if (document.fullscreenElement) { document.exitFullscreen(); return; }
-  if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {});
+  if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(function () {});
   else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
 }
 $('fullscreen').onclick = toggleFullscreen;
 video.addEventListener('click', toggleFullscreen);
-document.addEventListener('fullscreenchange', () => {
+document.addEventListener('fullscreenchange', function () {
   $('fullscreen').textContent = document.fullscreenElement ? 'Exit fullscreen' : 'Fullscreen';
   poke();
 });
 
 // In fullscreen, hide the controls and cursor after 3 s without the mouse
 // moving. In a window they stay: a vanishing cursor there is a bug report.
-let idleTimer;
+var idleTimer;
 function poke() {
   document.body.classList.remove('idle');
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => { if (document.fullscreenElement) document.body.classList.add('idle'); }, 3000);
+  idleTimer = setTimeout(function () { if (document.fullscreenElement) document.body.classList.add('idle'); }, 3000);
 }
-for (const ev of ['mousemove', 'mousedown', 'touchstart', 'keydown']) document.addEventListener(ev, poke, {passive: true});
+['mousemove', 'mousedown', 'touchstart', 'keydown'].forEach(function (ev) { document.addEventListener(ev, poke, {passive: true}); });
 poke();
 
+// --- playback: staying in sync --------------------------------------------
 // Where the schedule says we should be right now.
 function target() {
   if (!schedule) return {state: 'idle'};
-  const t = (serverNow() - schedule.start_ms) / 1000;
+  var t = (serverNow() - schedule.start_ms) / 1000;
   if (t < 0) return {state: 'waiting', in: -t};
   if (loadError) return {state: 'error'};
   if (isNaN(duration)) return {state: 'loading'};
@@ -141,42 +154,206 @@ function wrapDrift(d) {
   return ((d + duration / 2) % duration + duration) % duration - duration / 2;
 }
 
-let lastDrift = 0, seeks = 0;
-const SEEK_ABOVE = 0.5;     // s: jump
-const NUDGE_ABOVE = 0.05;   // s: bend playbackRate
-const MAX_NUDGE = 0.08;     // ±8 % speed
+// Players differ in what they let us do. A desktop browser seeks to the
+// exact frame and honours playbackRate. A TV browser (Samsung's among
+// them) tends to land a seek on the nearest keyframe, take a while to get
+// there, report currentTime in coarse steps, and quietly ignore
+// playbackRate. Corrected naively that is a picture that hops: every seek
+// lands somewhere else, so every tick seeks again.
+//
+// So every correction is checked for whether it worked. A seek that lands
+// ahead of where we should be is *held*: the picture pauses on that frame
+// and resumes the instant the schedule catches up, which is exact on any
+// player. A seek that lands behind is stepped forward, in doubling steps,
+// until one lands ahead and can be held. A rate that the player ignores is
+// never set again.
+var SEEK_ABOVE = 0.5;        // s: raw drift beyond which we seek...
+var SEEK_COOLDOWN = 3000;    // ms: ...but never more often than this
+var KEYFRAME_TOL = 1.0;      // s: on a keyframe-seeking player, live with this much
+var HOLD_ABOVE = 0.15;       // s: landed this far ahead -> pause and wait
+var NUDGE_ABOVE = 0.08;      // s: smoothed drift beyond which we bend the rate
+var NUDGE_RELEASE = 0.03;    // s: ...and below which we let it go
+var MAX_NUDGE = 0.08;        // ±8 % speed
+var RATE_STEP = 0.02;        // rates are quantised and held, not re-set every tick
+var RATE_HOLD = 2000;        // ms
+var MAX_STEPS = 5;           // forward steps before accepting a landing behind
+
+var seeks = 0, holds = 0, lastDrift = 0, smooth = null;
+var keyframeMode, lastSeekAt, seekTarget, seekIssuedAt, seekErr, seekLatency, stepping;
+var holding, playIssuedAt, playLatency, refine, resumeTimer = null;
+var stall, settle;   // the clock's stall after a seek or resume, and the pending measurement of it
+var rateWorks, rateValue, rateSetAt, rateProbe;
+
+function resetController() {
+  keyframeMode = false; lastSeekAt = -Infinity; seekTarget = NaN; seekIssuedAt = 0;
+  seekErr = NaN; seekLatency = 0; stepping = 0; smooth = null;
+  holding = false; playIssuedAt = 0; playLatency = 0; refine = false; stall = 0; settle = null;
+  if (resumeTimer) { clearTimeout(resumeTimer); resumeTimer = null; }
+  rateWorks = null; rateValue = 1; rateSetAt = 0; rateProbe = null;
+}
+resetController();
+
+function seekTo(pos) {
+  var now = Date.now();
+  lastSeekAt = seekIssuedAt = now; seekTarget = pos;
+  rateProbe = null; smooth = null;
+  if (rateValue !== 1) { video.playbackRate = 1; rateValue = 1; rateSetAt = now; }
+  // Aim ahead by the latency the last seeks showed, and by a doubling step
+  // while we are hunting for a keyframe past the target.
+  var aim = pos + seekLatency + stall + (stepping ? 0.5 * Math.pow(2, stepping - 1) : 0);
+  if (schedule.loop && duration) aim = aim % duration;
+  video.currentTime = aim;
+  seeks++;
+}
+
+// Where did the seek land, relative to where we should be *now*?
+video.addEventListener('seeked', function () {
+  if (isNaN(seekTarget)) return;                 // the element's own loop wrap
+  var t = target(); if (t.state !== 'playing') return;
+  var now = Date.now();
+  var lat = (now - seekIssuedAt) / 1000;
+  seekLatency = Math.min(5, seekLatency === 0 ? lat : seekLatency * 0.7 + lat * 0.3);
+  seekErr = wrapDrift(video.currentTime - t.pos);
+  seekTarget = NaN;
+  if (seekErr > HOLD_ABOVE) {
+    // Ahead: freeze here and let the schedule arrive.
+    holding = true; holds++; stepping = 0;
+    video.pause();
+  } else if (seekErr < -SEEK_ABOVE) {
+    // Behind, and by more than a seek should miss: a keyframe player. Ask
+    // for a point further ahead until a landing is ahead of the target.
+    keyframeMode = true;
+    if (stepping < MAX_STEPS) { stepping++; seekTo(t.pos); }
+    else stepping = 0;
+  } else {
+    stepping = 0;
+    settle = {wall: now, drift: seekErr};
+  }
+});
+
+// After a seek or a resume the clock lands, then stalls while the decoder
+// spins up, then runs. Whatever it lost is measured once it is running and
+// aimed for the next time.
+function checkSettle(raw) {
+  if (!settle) return;
+  var now = Date.now();
+  if (now - settle.wall < 1500) return;
+  var lost = Math.max(0, Math.min(2, settle.drift - raw));
+  stall = stall === 0 ? lost : stall * 0.7 + lost * 0.3;
+  settle = null;
+}
+
+// Resume a hold: the schedule has reached the frame we are paused on.
+// play() takes a moment before the clock moves -- and the `playing` event
+// fires before it does, so the latency is measured as the time until
+// currentTime itself advances -- and the next resume is that much early.
+var playPoll = null;
+function watchResume(ct0) {
+  if (playPoll) clearInterval(playPoll);
+  playPoll = setInterval(function () {
+    // Not the first tick of the clock -- some players tick once and then
+    // stall while the decoder spins up -- but the point at which it has
+    // clearly been running.
+    var elapsed = (Date.now() - playIssuedAt) / 1000, moved = video.currentTime - ct0;
+    if (moved >= 0.1) {
+      var lat = Math.max(0, elapsed - moved);
+      playLatency = Math.min(2, playLatency === 0 ? lat : playLatency * 0.7 + lat * 0.3);
+    } else if (elapsed < 3) return;
+    clearInterval(playPoll); playPoll = null; playIssuedAt = 0;
+  }, 20);
+}
+function checkHold(pos) {
+  // Resume at the moment, not at the next 250 ms tick.
+  var wait = (wrapDrift(video.currentTime - pos) - playLatency - stall) * 1000;
+  if (wait > 250 || resumeTimer) return;
+  resumeTimer = setTimeout(resume, Math.max(0, wait));
+}
+function resume() {
+  resumeTimer = null;
+  if (!holding) return;
+  holding = false;
+  // The first hold resumes blind to how long play() takes; once that is
+  // measured, one more hold is allowed to take the residual out. One, so
+  // a jittery player cannot be made to freeze every few seconds.
+  refine = stall === 0;
+  playIssuedAt = Date.now();
+  video.play().catch(function () {});
+  watchResume(video.currentTime);
+  settle = {wall: playIssuedAt, drift: wrapDrift(video.currentTime - target().pos)};
+}
+
+function setRate(want) {
+  var now = Date.now();
+  if (want === rateValue || now - rateSetAt < RATE_HOLD) return;
+  video.playbackRate = want;
+  rateValue = want; rateSetAt = now;
+  // Prove it took: after two seconds at this rate the clock should have
+  // advanced at it. A player that ignores the rate advances at 1.0.
+  rateProbe = want === 1 ? null : {wall: now, ct: video.currentTime, rate: want};
+}
+function checkRateProbe() {
+  if (!rateProbe || video.seeking) return;
+  var now = Date.now();
+  if (now - rateProbe.wall < 2000) return;
+  var measured = (video.currentTime - rateProbe.ct) / ((now - rateProbe.wall) / 1000);
+  rateProbe = null;
+  if (measured < 0) return;                                  // wrapped; inconclusive
+  if (Math.abs(measured - rateValue) < 0.03) rateWorks = true;
+  else if (Math.abs(measured - 1) < 0.02) rateWorks = false; // ignored
+}
+
+function correct(pos) {
+  if (holding) { checkHold(pos); return; }
+  if (stepping || video.seeking || video.readyState < 2) return;
+  var raw = wrapDrift(video.currentTime - pos);            // + means ahead
+  lastDrift = raw;
+  smooth = smooth === null ? raw : smooth + (raw - smooth) * 0.3;
+  var now = Date.now();
+  checkRateProbe();
+  checkSettle(raw);
+
+  var threshold = keyframeMode ? KEYFRAME_TOL : SEEK_ABOVE;
+  if (refine && rateWorks === false && Math.abs(smooth) > HOLD_ABOVE) threshold = HOLD_ABOVE;
+  if (Math.abs(raw) > threshold && now - lastSeekAt > SEEK_COOLDOWN) {
+    stepping = 0; refine = false;
+    seekTo(pos);
+    return;
+  }
+  if (rateWorks === false) { if (rateValue !== 1) setRate(1); return; }
+  var want = rateValue;
+  if (Math.abs(smooth) > NUDGE_ABOVE) {
+    var n = Math.max(-MAX_NUDGE, Math.min(MAX_NUDGE, smooth));
+    want = 1 - Math.round(n / RATE_STEP) * RATE_STEP;
+  } else if (Math.abs(smooth) < NUDGE_RELEASE) {
+    want = 1;
+  }
+  setRate(+want.toFixed(2));
+}
 
 function tick() {
-  const t = target();
-  let hudDrift = '';
+  var t = target();
+  var hud = '';
   switch (t.state) {
     case 'idle':    pause(); show('Nothing scheduled', 'Waiting for the administrator'); break;
     case 'waiting': pause(); show('Starting in ' + fmt(t.in), schedule.file); break;
     case 'loading': pause(); show('Loading…', schedule.file); break;
     case 'error':   pause(); show('Cannot play this file', schedule.file + ' — is it H.264/AAC MP4 or WebM?'); break;
     case 'ended':   pause(); show('Stream ended', schedule.file); break;
-    case 'playing': {
+    case 'playing':
       ensurePlaying();
       if (needGesture) { show('Live', schedule.file, true); break; }
       hide();
-      if (!video.seeking && video.readyState >= 2) {
-        const drift = wrapDrift(video.currentTime - t.pos);   // + means ahead
-        lastDrift = drift;
-        if (Math.abs(drift) > SEEK_ABOVE) {
-          video.currentTime = t.pos;
-          video.playbackRate = 1; seeks++;
-        } else if (Math.abs(drift) > NUDGE_ABOVE) {
-          video.playbackRate = 1 - Math.max(-MAX_NUDGE, Math.min(MAX_NUDGE, drift));
-        } else {
-          video.playbackRate = 1;
-        }
-      }
-      hudDrift = `${fmt(t.pos)} / ${fmt(duration)}${schedule.loop ? ' ↻' : ''}  drift ${(lastDrift * 1000).toFixed(0).padStart(5)}ms  rate ${video.playbackRate.toFixed(2)}  seeks ${seeks}\n`;
+      correct(t.pos);
+      hud = fmt(t.pos) + ' / ' + fmt(duration) + (schedule.loop ? ' ↻' : '') +
+        (holding ? '  HOLDING ' + ms(wrapDrift(video.currentTime - t.pos)) : '  drift ' + ms(lastDrift) + ' (avg ' + ms(smooth || 0) + ')') +
+        '  rate ' + rateValue.toFixed(2) + (rateWorks === null ? ' ?' : rateWorks ? ' ok' : ' ignored') +
+        '  seeks ' + seeks + ' holds ' + holds + (isNaN(seekErr) ? '' : ' landed ' + ms(seekErr) + ' off, ' + (seekLatency * 1000).toFixed(0) + 'ms late, stall ' + (stall * 1000).toFixed(0) + 'ms') +
+        (keyframeMode ? '  keyframe player' : '') + '\n';
       break;
-    }
   }
   $('unmute').classList.toggle('hidden', !(t.state === 'playing' && video.muted && !needGesture));
-  $('hud').textContent = hudDrift + `clock offset ${offset.toFixed(0)}ms  rtt ${isNaN(offsetRtt) ? '?' : offsetRtt + 'ms'}`;
+  $('hud').textContent = hud + 'clock offset ' + offset.toFixed(0) + 'ms  rtt ' + (isNaN(offsetRtt) ? '?' : offsetRtt + 'ms') +
+    '  ' + ua();
 }
 
 function pause() { if (!video.paused) video.pause(); }
@@ -186,11 +363,17 @@ function show(title, sub, join) {
   $('join').classList.toggle('hidden', !join);
 }
 function hide() { $('overlay').classList.add('hidden'); }
+function ms(s) { var v = (s * 1000).toFixed(0) + 'ms'; while (v.length < 7) v = ' ' + v; return v; }
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
 function fmt(s) {
   s = Math.max(0, Math.floor(s));
-  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
-  const mm = String(m).padStart(2, '0'), ss = String(sec).padStart(2, '0');
-  return h ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+  var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
+  return h ? h + ':' + pad2(m) + ':' + pad2(sec) : m + ':' + pad2(sec);
+}
+// Enough of the user agent to tell a TV from a laptop in a photo of the HUD.
+function ua() {
+  var u = navigator.userAgent, m = /(SMART-TV|Tizen[^;)]*|SmartTV|Web0S|Chrome\/\d+|Safari\/\d+|Firefox\/\d+)/i.exec(u);
+  return m ? m[1] : '';
 }
 
 syncClock();

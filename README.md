@@ -46,6 +46,24 @@ cargo run --release -- --media-dir /path/to/videos --listen 0.0.0.0:8080
 Put it behind TLS if it leaves the machine: the admin token travels as a
 bearer header.
 
+## TV browsers
+
+A TV browser (Samsung's Tizen one among them) is not a laptop's: it lands
+a seek on the nearest keyframe rather than the frame asked for, takes a
+moment to get there, and may ignore `playbackRate` altogether. The viewer
+notices each of those from what the player actually does and adapts: a
+seek that lands ahead of the schedule is *held* -- paused on that frame
+until the schedule catches up, which is exact on any player -- one that
+lands behind is stepped forward until it can be held, a rate the player
+ignores is never set again, and the clock's stall after a seek is measured
+and aimed for next time. The HUD names what it found (`keyframe player`,
+`rate ignored`, `stall`), and is legible from a sofa on a screen 1600 px
+or wider.
+
+The other half is the file: on a keyframe-seeking player the keyframe
+interval bounds how far off a join lands and how long a hold freezes.
+`scripts/transcode` writes one every 2 s.
+
 ## Files that will play
 
 Only what browsers decode natively: H.264/AAC MP4 (`.mp4`, `.m4v`, `.mov`)
@@ -56,11 +74,15 @@ seek into the middle when they join; convert with
 ffmpeg -i input.mkv -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart out.mp4
 ```
 
+`scripts/transcode input output.mp4` produces the form that streams best
+here -- H.264 High 4.1, at most 1080p, a keyframe every 2 s, capped
+bitrate, AAC stereo, `+faststart` -- from anything ffmpeg reads.
+
 A 30 s test clip with a running counter, useful for checking sync by eye:
 
 ```bash
 ffmpeg -f lavfi -i testsrc=size=640x360:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
-  -t 30 -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart media/clock-30s.mp4
+  -t 30 -c:v libx264 -pix_fmt yuv420p -c:a aac /tmp/raw.mp4 && scripts/transcode /tmp/raw.mp4 media/clock-30s.mp4
 ```
 
 ## API

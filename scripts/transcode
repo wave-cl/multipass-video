@@ -1,0 +1,29 @@
+#!/bin/sh
+# Transcode a video into the form that streams best through multipass-video:
+#
+#   scripts/transcode input.mkv output.mp4
+#
+# - H.264 High profile, level 4.1, yuv420p, at most 1080p: what every
+#   browser and every TV decodes in hardware.
+# - A keyframe every 2 s, closed GOP. A TV browser seeks to keyframes, not
+#   frames, so the interval bounds how far off a join lands and how long the
+#   viewer's "hold" freezes while the schedule catches up.
+# - Capped bitrate so a client that joins mid-file can fetch faster than
+#   it plays; AAC stereo 48 kHz; the moov atom at the front (+faststart) so
+#   the browser can seek into the middle before the whole file has arrived.
+# - Subtitle and data streams dropped; browsers do not render them in MP4.
+set -eu
+in=${1:?input}; out=${2:?output.mp4}
+case "$out" in *.mp4) ;; *) echo "output must be .mp4" >&2; exit 1 ;; esac
+ffmpeg -hide_banner -nostdin -y -i "$in" \
+  -map 0:v:0 -map '0:a:0?' -sn -dn \
+  -vf "scale='min(1920,iw)':-2" \
+  -c:v libx264 -preset slow -crf 20 -profile:v high -level 4.1 -pix_fmt yuv420p \
+  -force_key_frames 'expr:gte(t,n_forced*2)' -sc_threshold 0 -x264-params open-gop=0 \
+  -maxrate 8M -bufsize 16M \
+  -c:a aac -ac 2 -ar 48000 -b:a 160k \
+  -movflags +faststart \
+  "$out"
+echo
+echo "keyframes at:"
+ffprobe -v error -select_streams v -skip_frame nokey -show_entries frame=pts_time -of csv=p=0 "$out" | head -8 | tr '\n' ' '; echo "..."
