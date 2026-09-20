@@ -56,5 +56,6 @@ systemctl reload caddy || systemctl restart caddy
 
 sleep 1
 systemctl is-active multipass-video caddy
-curl -fsS http://127.0.0.1:8080/api/state; echo
+# /login is the one page that is open when a viewer key is set.
+curl -fsS -o /dev/null -w "login page: %{http_code}\n" http://127.0.0.1:8080/login
 REMOTE
