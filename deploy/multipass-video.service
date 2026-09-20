@@ -13,6 +13,8 @@ Environment=MULTIPASS_LISTEN=127.0.0.1:8080
 Environment=MULTIPASS_MEDIA_DIR=/srv/multipass/media
 Environment=MULTIPASS_ADMIN_TOKEN_FILE=/var/lib/multipass-video/admin-token
 Environment=MULTIPASS_STATE_FILE=/var/lib/multipass-video/state.json
+# Viewers need the key in this file (minted on first start, 0600) at /login.
+Environment=MULTIPASS_VIEWER_KEY_FILE=/var/lib/multipass-video/viewer-key
 Environment=RUST_LOG=info,tower_http=warn
 Restart=on-failure
 RestartSec=2

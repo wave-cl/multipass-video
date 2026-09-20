@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>multipass</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#eee;font:18px system-ui,sans-serif}
+  body{display:flex;align-items:center;justify-content:center;padding:16px}
+  form{background:#1b1b1b;border-radius:12px;padding:28px;width:100%;max-width:380px;box-sizing:border-box}
+  h1{font-size:20px;margin:0 0 18px}
+  input{font:inherit;font-size:24px;letter-spacing:.08em;padding:12px;border-radius:8px;border:1px solid #333;background:#000;color:#eee;width:100%;box-sizing:border-box;margin-bottom:14px}
+  button{font:inherit;padding:12px 20px;border-radius:8px;border:0;background:#fff;color:#000;cursor:pointer;width:100%}
+  p{margin:0 0 14px;color:#f66;min-height:1.2em}
+  @media (min-width:1600px){html,body{font-size:28px}input{font-size:36px}form{max-width:640px}}
+</style>
+</head>
+<body>
+<form method="post" action="/login" autocomplete="off">
+  <h1>Enter the viewer key</h1>
+  <p>{{error}}</p>
+  <input name="key" type="text" autocapitalize="none" autocorrect="off" spellcheck="false" inputmode="text" autofocus>
+  <button type="submit">Watch</button>
+</form>
+</body>
+</html>

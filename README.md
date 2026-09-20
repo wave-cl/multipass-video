@@ -30,6 +30,15 @@ on Apple silicon — each holding the binary and this README. Or build it:
 cargo install --path .
 ```
 
+## Who can watch
+
+With `--viewer-key-file` (or `MULTIPASS_VIEWER_KEY_FILE`) set, every page,
+API call and byte of media needs a cookie that `/login` sets once per
+device from the key in that file -- ten lowercase characters, minted on
+first start, chosen to be typed on a TV remote. Without it, anyone with
+the URL can watch. The deploy unit sets it; read the key with
+`ssh HOST cat /var/lib/multipass-video/viewer-key`.
+
 ## Run
 
 ```bash

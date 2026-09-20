@@ -16,18 +16,20 @@ use std::{
 };
 
 use axum::{
-    extract::State,
-    http::{header, HeaderMap, StatusCode},
+    extract::{Request, State},
+    http::{header, HeaderMap, Method, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
-        Html, IntoResponse,
+        Html, IntoResponse, Redirect, Response,
     },
     routing::{get, post},
-    Json, Router,
+    Form, Json, Router,
 };
 use clap::Parser;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio_stream::{wrappers::WatchStream, Stream, StreamExt};
 use tower_http::{services::ServeDir, trace::TraceLayer};
@@ -35,6 +37,8 @@ use tracing::{info, warn};
 
 const VIEWER_HTML: &str = include_str!("../static/viewer.html");
 const ADMIN_HTML: &str = include_str!("../static/admin.html");
+const LOGIN_HTML: &str = include_str!("../static/login.html");
+const VIEWER_COOKIE: &str = "mp_viewer";
 
 /// Extensions browsers can generally play natively.
 const PLAYABLE: &[&str] = &["mp4", "m4v", "webm", "mov", "ogv", "ogg"];
@@ -65,6 +69,12 @@ struct Args {
         default_value = "multipass-state.json"
     )]
     state_file: PathBuf,
+
+    /// File holding the viewer key. Set, every page and stream needs it
+    /// (entered once per device at /login); unset, anyone can watch.
+    /// Created (0600, ten random lowercase characters) if absent.
+    #[arg(long, env = "MULTIPASS_VIEWER_KEY_FILE")]
+    viewer_key_file: Option<PathBuf>,
 }
 
 /// What is scheduled. `start_ms` is unix milliseconds on the server clock.
@@ -117,10 +127,17 @@ struct ScheduleRequest {
     loop_: bool,
 }
 
+#[derive(Deserialize)]
+struct LoginForm {
+    key: String,
+}
+
 struct Inner {
     media_dir: PathBuf,
     state_file: PathBuf,
     admin_token: String,
+    /// The viewer key and the cookie value that proves it (its SHA-256, hex).
+    viewer: Option<(String, String)>,
     state: Mutex<Persisted>,
     /// Carries the version; SSE subscribers wake on it and re-read the state.
     notify: watch::Sender<u64>,
@@ -212,8 +229,10 @@ fn load_state(path: &Path) -> Persisted {
     }
 }
 
-/// Read the admin token, or mint one: 32 random bytes as hex in a 0600 file.
-fn load_or_create_token(path: &Path) -> std::io::Result<String> {
+/// Read a secret from a file, or mint one into it (0600). The admin token
+/// is 32 random bytes as hex; the viewer key is ten lowercase characters,
+/// because it gets typed on a TV remote.
+fn load_or_create_secret(path: &Path, what: &str, short: bool) -> std::io::Result<String> {
     if let Ok(s) = std::fs::read_to_string(path) {
         let s = s.trim().to_string();
         if !s.is_empty() {
@@ -222,7 +241,15 @@ fn load_or_create_token(path: &Path) -> std::io::Result<String> {
     }
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let token: String = if short {
+        const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789"; // no 0/o/1/l/i
+        bytes[..10]
+            .iter()
+            .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+            .collect()
+    } else {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    };
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -232,8 +259,75 @@ fn load_or_create_token(path: &Path) -> std::io::Result<String> {
     }
     let mut f = opts.open(path)?;
     writeln!(f, "{token}")?;
-    info!("created admin token file {}", path.display());
+    info!("created {what} file {}", path.display());
     Ok(token)
+}
+
+fn cookie_value(key: &str) -> String {
+    Sha256::digest(key.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Everything but /login needs the viewer cookie, when a viewer key is set.
+/// A browser asking for a page is sent to log in; anything else gets 401.
+async fn viewer_gate(State(app): State<App>, req: Request, next: Next) -> Response {
+    let Some((_, expect)) = &app.viewer else {
+        return next.run(req).await;
+    };
+    if req.uri().path() == "/login" {
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(';'))
+        .filter_map(|c| {
+            c.trim()
+                .strip_prefix(VIEWER_COOKIE)
+                .and_then(|c| c.strip_prefix('='))
+        })
+        .any(|v| ct_eq(v.as_bytes(), expect.as_bytes()));
+    if presented {
+        return next.run(req).await;
+    }
+    let wants_page = req.method() == Method::GET
+        && req
+            .headers()
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|a| a.contains("text/html"));
+    if wants_page {
+        Redirect::to("/login").into_response()
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+async fn login_page() -> Html<String> {
+    Html(LOGIN_HTML.replace("{{error}}", ""))
+}
+
+async fn login_post(State(app): State<App>, Form(form): Form<LoginForm>) -> Response {
+    let Some((key, cookie)) = &app.viewer else {
+        return Redirect::to("/").into_response();
+    };
+    if ct_eq(form.key.trim().as_bytes(), key.as_bytes()) {
+        let set =
+            format!("{VIEWER_COOKIE}={cookie}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax");
+        ([(header::SET_COOKIE, set)], Redirect::to("/")).into_response()
+    } else {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        warn!("viewer login refused");
+        (
+            StatusCode::UNAUTHORIZED,
+            Html(LOGIN_HTML.replace("{{error}}", "That key was not accepted.")),
+        )
+            .into_response()
+    }
 }
 
 async fn viewer() -> Html<&'static str> {
@@ -355,6 +449,7 @@ fn router(app: App) -> Router {
     let media = ServeDir::new(&app.media_dir);
     Router::new()
         .route("/", get(viewer))
+        .route("/login", get(login_page).post(login_post))
         .route("/admin", get(admin))
         .route("/api/state", get(get_state))
         .route("/api/events", get(events))
@@ -362,6 +457,7 @@ fn router(app: App) -> Router {
         .route("/api/schedule", post(set_schedule).delete(clear_schedule))
         .route("/api/trace", post(post_trace))
         .nest_service("/media", media)
+        .layer(middleware::from_fn_with_state(app.clone(), viewer_gate))
         .layer(TraceLayer::new_for_http())
         .with_state(app)
 }
@@ -379,7 +475,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.media_dir.is_dir() {
         return Err(format!("media dir {} is not a directory", args.media_dir.display()).into());
     }
-    let admin_token = load_or_create_token(&args.admin_token_file)?;
+    let admin_token = load_or_create_secret(&args.admin_token_file, "admin token", false)?;
+    let viewer = match &args.viewer_key_file {
+        Some(p) => {
+            let key = load_or_create_secret(p, "viewer key", true)?;
+            info!("viewers must log in with the key in {}", p.display());
+            Some((key.clone(), cookie_value(&key)))
+        }
+        None => {
+            info!("no viewer key file: anyone can watch");
+            None
+        }
+    };
     let state = load_state(&args.state_file);
     if let Some(s) = &state.schedule {
         info!(?s, "restored schedule");
@@ -390,6 +497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         media_dir: args.media_dir.clone(),
         state_file: args.state_file,
         admin_token,
+        viewer,
         state: Mutex::new(state),
         notify,
     });
@@ -435,6 +543,95 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
         assert!(!ct_eq(b"", b"a"));
+    }
+
+    fn test_app(viewer_key: Option<&str>) -> Router {
+        let dir = std::env::temp_dir().join(format!("multipass-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (notify, _) = watch::channel(0);
+        let app: App = Arc::new(Inner {
+            media_dir: dir.clone(),
+            state_file: dir.join("state.json"),
+            admin_token: "admin".into(),
+            viewer: viewer_key.map(|k| (k.to_string(), cookie_value(k))),
+            state: Mutex::new(Persisted::default()),
+            notify,
+        });
+        router(app)
+    }
+
+    async fn call(app: &Router, req: Request) -> (StatusCode, HeaderMap) {
+        use tower::ServiceExt;
+        let res = app.clone().oneshot(req).await.unwrap();
+        (res.status(), res.headers().clone())
+    }
+
+    fn get(path: &str) -> Request {
+        Request::get(path).body(Default::default()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_a_viewer_key_anyone_can_watch() {
+        let app = test_app(None);
+        assert_eq!(call(&app, get("/api/state")).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn with_a_viewer_key_everything_needs_the_cookie() {
+        let app = test_app(Some("hunter2"));
+        // API and media: 401. A browser asking for a page: sent to /login.
+        for path in ["/api/state", "/api/events", "/media/x.mp4", "/api/files"] {
+            assert_eq!(
+                call(&app, get(path)).await.0,
+                StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+        }
+        for path in ["/", "/admin"] {
+            let req = Request::get(path)
+                .header(header::ACCEPT, "text/html")
+                .body(Default::default())
+                .unwrap();
+            let (s, h) = call(&app, req).await;
+            assert_eq!(s, StatusCode::SEE_OTHER, "{path}");
+            assert_eq!(h[header::LOCATION], "/login");
+        }
+        // The login page itself is open.
+        assert_eq!(call(&app, get("/login")).await.0, StatusCode::OK);
+
+        // A wrong key is refused, the right one sets the cookie.
+        let login = |key: &str| {
+            Request::post("/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(format!("key={key}").into())
+                .unwrap()
+        };
+        let (s, h) = call(&app, login("hunter3")).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert!(h.get(header::SET_COOKIE).is_none());
+        let (s, h) = call(&app, login("hunter2")).await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        let cookie = h[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(cookie.starts_with("mp_viewer="));
+
+        // With it, the API answers; a forged cookie does not.
+        let with = |c: &str| {
+            Request::get("/api/state")
+                .header(header::COOKIE, c)
+                .body(Default::default())
+                .unwrap()
+        };
+        assert_eq!(call(&app, with(&cookie)).await.0, StatusCode::OK);
+        assert_eq!(
+            call(&app, with("mp_viewer=deadbeef")).await.0,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]

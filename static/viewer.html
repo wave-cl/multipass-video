@@ -48,7 +48,7 @@ function serverNow() { return Date.now() + offset; }
 function sample() {
   var t0 = Date.now();
   return fetch('/api/state', {cache: 'no-store'})
-    .then(function (r) { return r.json(); })
+    .then(function (r) { if (r.status === 401) location.href = '/login'; return r.json(); })
     .then(function (s) { return {s: s, t0: t0, rtt: Date.now() - t0}; })
     .catch(function () { return null; });
 }
