@@ -205,6 +205,7 @@ function wrapDrift(d) {
 // until one lands ahead and can be held. A rate that the player ignores is
 // never set again.
 var SEEK_ABOVE = 0.5;        // s: raw drift beyond which we seek...
+var SEEK_ONLY_ABOVE = 0.75;  // s: ...or this much, on a player that can only seek
 var SEEK_COOLDOWN = 3000;    // ms: ...but never more often than this
 var KEYFRAME_TOL = 1.0;      // s: on a keyframe-seeking player, live with this much
 var HOLD_ABOVE = 0.15;       // s: landed this far ahead -> pause and wait
@@ -215,18 +216,24 @@ var RATE_STEP = 0.02;        // rates are quantised and held, not re-set every t
 var RATE_HOLD = 2000;        // ms
 var MAX_STEPS = 5;           // forward steps before accepting a landing behind
 
-var seeks = 0, holds = 0, lastDrift = 0, smooth = null;
+// Samsung's browser is known: a rate change flushes the decoder to the
+// next keyframe, and so does resuming from a pause (seen in its trace,
+// 2026-09-20). Other players are found out the same way, at run time.
+var SAMSUNG = /Tizen|SMART-TV|SamsungBrowser/i.test(navigator.userAgent);
+
+var seeks = 0, holds = 0, lastDrift = 0, smooth = null, backoff = 0;
 var keyframeMode, lastSeekAt, seekTarget, seekIssuedAt, seekErr, seekLatency, stepping;
-var holding, playIssuedAt, playLatency, refine, resumeTimer = null;
+var holding, playIssuedAt, playLatency, holdWorks, resumeTimer = null;
 var stall, settle;   // the clock's stall after a seek or resume, and the pending measurement of it
 var rateWorks, rateValue, rateSetAt, rateProbe;
 
 function resetController() {
   keyframeMode = false; lastSeekAt = -Infinity; seekTarget = NaN; seekIssuedAt = 0;
   seekErr = NaN; seekLatency = 0; stepping = 0; smooth = null;
-  holding = false; playIssuedAt = 0; playLatency = 0; refine = false; stall = 0; settle = null;
+  holding = false; playIssuedAt = 0; playLatency = 0; stall = 0; settle = null; backoff = 0;
   if (resumeTimer) { clearTimeout(resumeTimer); resumeTimer = null; }
-  rateWorks = null; rateValue = 1; rateSetAt = 0; rateProbe = null;
+  holdWorks = SAMSUNG ? false : null;
+  rateWorks = SAMSUNG ? false : null; rateValue = 1; rateSetAt = 0; rateProbe = null;
 }
 resetController();
 
@@ -254,7 +261,10 @@ video.addEventListener('seeked', function () {
   seekErr = wrapDrift(video.currentTime - t.pos);
   seekTarget = NaN;
   trace('landed ct=' + video.currentTime.toFixed(3) + ' pos=' + t.pos.toFixed(3) + ' err=' + seekErr.toFixed(3) + ' after=' + lat.toFixed(3) + 's');
-  if (seekErr > HOLD_ABOVE) {
+  // The seek aimed ahead by the stall on purpose; that lead is not an
+  // error, the stall is about to consume it. Hold only beyond it, and only
+  // on a player whose resume does not itself jump.
+  if (holdWorks !== false && seekErr > stall + HOLD_ABOVE) {
     // Ahead: freeze here and let the schedule arrive.
     holding = true; holds++; stepping = 0;
     video.pause();
@@ -271,6 +281,18 @@ video.addEventListener('seeked', function () {
   }
 });
 
+// A player that restarts from the next keyframe on play() cannot hold:
+// the clock jumps on resume. Seen once, holds are over for this file.
+video.addEventListener('playing', function () {
+  if (!playIssuedAt || holdWorks === false) return;
+  var elapsed = (Date.now() - playIssuedAt) / 1000;
+  if (video.currentTime - resumedAt > elapsed + 0.3) {
+    holdWorks = false;
+    trace('resume jumped ' + resumedAt.toFixed(3) + ' -> ' + video.currentTime.toFixed(3) + '; no more holds');
+  }
+});
+var resumedAt = 0;
+
 // After a seek or a resume the clock lands, then stalls while the decoder
 // spins up, then runs. Whatever it lost is measured once it is running and
 // aimed for the next time.
@@ -281,7 +303,11 @@ function checkSettle(raw) {
   var lost = Math.max(0, Math.min(2, settle.drift - raw));
   stall = stall === 0 ? lost : stall * 0.7 + lost * 0.3;
   settle = null;
-  trace('settled: lost ' + lost.toFixed(3) + ' -> stall ' + stall.toFixed(3));
+  // Settled within tolerance: the next seek, whenever it comes, need not
+  // wait longer than usual. Not: wait longer each time, so a player whose
+  // stall varies from seek to seek converges on seeking rarely.
+  if (Math.abs(raw) < SEEK_ABOVE) backoff = 0;
+  trace('settled: lost ' + lost.toFixed(3) + ' -> stall ' + stall.toFixed(3) + ' drift now ' + raw.toFixed(3) + ' backoff ' + backoff);
 }
 
 // Resume a hold: the schedule has reached the frame we are paused on.
@@ -317,7 +343,7 @@ function resume() {
   // The first hold resumes blind to how long play() takes; once that is
   // measured, one more hold is allowed to take the residual out. One, so
   // a jittery player cannot be made to freeze every few seconds.
-  refine = stall === 0;
+  resumedAt = video.currentTime;
   trace('resume ct=' + video.currentTime.toFixed(3) + ' pos=' + pos.toFixed(3) + ' playLat=' + playLatency.toFixed(3) + ' stall=' + stall.toFixed(3));
   playIssuedAt = Date.now();
   video.play().catch(function () {});
@@ -331,6 +357,17 @@ function setRate(want) {
   video.playbackRate = want;
   rateValue = want; rateSetAt = now;
   trace('rate set ' + want);
+  // A player that flushes on a rate change says so with `waiting` at once.
+  var onWaiting = function () {
+    video.removeEventListener('waiting', onWaiting);
+    if (Date.now() - rateSetAt < 400 && rateWorks !== false) {
+      rateWorks = false; rateProbe = null;
+      trace('waiting right after a rate change: player flushes on it; rate is off');
+      if (rateValue !== 1) { video.playbackRate = 1; rateValue = 1; }
+    }
+  };
+  video.addEventListener('waiting', onWaiting);
+  setTimeout(function () { video.removeEventListener('waiting', onWaiting); }, 500);
   // Prove it took: after two seconds at this rate the clock should have
   // advanced at it. A player that ignores the rate advances at 1.0.
   rateProbe = want === 1 ? null : {wall: now, ct: video.currentTime, rate: want};
@@ -362,17 +399,21 @@ function correct(pos) {
   checkRateProbe();
   checkSettle(raw);
 
-  var threshold = keyframeMode ? KEYFRAME_TOL : SEEK_ABOVE;
-  if (refine && rateWorks === false && Math.abs(smooth) > HOLD_ABOVE) threshold = HOLD_ABOVE;
+  // A player that can only seek pays a visible stall for every correction,
+  // so it is allowed a little more slack than one that can nudge silently.
+  var threshold = keyframeMode ? KEYFRAME_TOL : rateWorks === false ? SEEK_ONLY_ABOVE : SEEK_ABOVE;
   // Both the sample and the average: a player that reports currentTime in
   // coarse steps produces single samples a step off, and a seek on one of
-  // those is a hop for nothing.
-  if (Math.abs(raw) > threshold && Math.abs(smooth) > threshold && now - lastSeekAt > SEEK_COOLDOWN) {
-    stepping = 0; refine = false;
+  // those is a hop for nothing. And not while the last seek is still
+  // settling, nor sooner than the backoff allows.
+  var cooldown = Math.min(30000, SEEK_COOLDOWN * Math.pow(2, backoff));
+  if (!settle && Math.abs(raw) > threshold && Math.abs(smooth) > threshold && now - lastSeekAt > cooldown) {
+    stepping = 0; backoff++;
     seekTo(pos);
     return;
   }
   if (rateWorks === false) { if (rateValue !== 1) setRate(1); return; }
+  if (settle) return;                  // no rate change on a clock that is still stalling
   var want = rateValue;
   if (Math.abs(smooth) > NUDGE_ABOVE) {
     var n = Math.max(-MAX_NUDGE, Math.min(MAX_NUDGE, smooth));
@@ -401,7 +442,7 @@ function tick() {
         (holding ? '  HOLDING ' + ms(wrapDrift(video.currentTime - t.pos)) : '  drift ' + ms(lastDrift) + ' (avg ' + ms(smooth || 0) + ')') +
         '  rate ' + rateValue.toFixed(2) + (rateWorks === null ? ' ?' : rateWorks ? ' ok' : ' ignored') +
         '  seeks ' + seeks + ' holds ' + holds + (isNaN(seekErr) ? '' : ' landed ' + ms(seekErr) + ' off, ' + (seekLatency * 1000).toFixed(0) + 'ms late, stall ' + (stall * 1000).toFixed(0) + 'ms') +
-        (keyframeMode ? '  keyframe player' : '') + '\n';
+        (keyframeMode ? '  keyframe player' : '') + (holdWorks === false ? '  no holds' : '') + (backoff ? '  backoff ' + backoff : '') + '\n';
       break;
   }
   $('unmute').classList.toggle('hidden', !(t.state === 'playing' && video.muted && !needGesture));
