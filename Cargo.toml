@@ -1,6 +1,6 @@
 [package]
 name = "multipass-video"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Schedule a video file on disk to stream to every viewer in sync"
 

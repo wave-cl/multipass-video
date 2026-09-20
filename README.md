@@ -60,6 +60,11 @@ and aimed for next time. The HUD names what it found (`keyframe player`,
 `rate ignored`, `stall`), and is legible from a sofa on a screen 1600 px
 or wider.
 
+To see what a particular player is doing, open the viewer with `?trace`
+on it: it reports every seek, landing, hold, rate verdict and element
+event to the server's log (`journalctl -u multipass-video -t multipass-video
+| grep viewer`), so a TV can be read from wherever the server is.
+
 The other half is the file: on a keyframe-seeking player the keyframe
 interval bounds how far off a join lands and how long a hold freezes.
 `scripts/transcode` writes one every 2 s.

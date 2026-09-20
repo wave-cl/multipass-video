@@ -67,6 +67,41 @@ function syncClock() {
   })(0);
 }
 
+// --- trace ----------------------------------------------------------------
+// Opened with ?trace, the viewer reports what its player does to the
+// server's log, so a TV can be read from wherever the server is.
+var TRACE = /[?&]trace/.test(location.search);
+var traceId = Math.random().toString(36).slice(2, 8), traceBuf = [];
+function trace(m) {
+  if (!TRACE) return;
+  traceBuf.push((serverNow() % 1000000 / 1000).toFixed(2) + ' ' + m);
+  if (traceBuf.length > 400) traceBuf.shift();
+}
+function flushTrace() {
+  if (!TRACE || !traceBuf.length) return;
+  var lines = traceBuf; traceBuf = [];
+  fetch('/api/trace', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: traceId, ua: navigator.userAgent, lines: lines})}).catch(function () {});
+}
+if (TRACE) {
+  setInterval(flushTrace, 3000);
+  ['play', 'pause', 'playing', 'waiting', 'stalled', 'seeking', 'seeked', 'ended', 'error', 'ratechange', 'loadedmetadata', 'canplay', 'emptied'].forEach(function (ev) {
+    video.addEventListener(ev, function () {
+      trace('evt ' + ev + ' ct=' + video.currentTime.toFixed(3) + ' rs=' + video.readyState + (ev === 'ratechange' ? ' rate=' + video.playbackRate : '') + (ev === 'error' && video.error ? ' code=' + video.error.code : ''));
+    });
+  });
+  var ctSeen = [];
+  setInterval(function () {
+    var t = target();
+    var distinct = {}; ctSeen.forEach(function (c) { distinct[c] = 1; });
+    trace('ct=' + video.currentTime.toFixed(3) + (t.pos !== undefined ? ' pos=' + t.pos.toFixed(3) + ' drift=' + (wrapDrift(video.currentTime - t.pos) * 1000).toFixed(0) : ' ' + t.state) +
+      ' rs=' + video.readyState + ' paused=' + video.paused + ' seeking=' + video.seeking + ' rate=' + video.playbackRate +
+      ' ctUpdates/s=' + Object.keys(distinct).length + ' hold=' + holding + ' step=' + stepping);
+    ctSeen = [];
+  }, 1000);
+  setInterval(function () { ctSeen.push(video.currentTime.toFixed(3)); }, 100);
+}
+
 // --- schedule changes -----------------------------------------------------
 function apply(s) {
   if (s.version === version) return;
@@ -204,6 +239,7 @@ function seekTo(pos) {
   if (schedule.loop && duration) aim = aim % duration;
   video.currentTime = aim;
   seeks++;
+  trace('seek pos=' + pos.toFixed(3) + ' aim=' + aim.toFixed(3) + ' step=' + stepping + ' lat=' + seekLatency.toFixed(3) + ' stall=' + stall.toFixed(3));
 }
 
 // Where did the seek land, relative to where we should be *now*?
@@ -215,10 +251,12 @@ video.addEventListener('seeked', function () {
   seekLatency = Math.min(5, seekLatency === 0 ? lat : seekLatency * 0.7 + lat * 0.3);
   seekErr = wrapDrift(video.currentTime - t.pos);
   seekTarget = NaN;
+  trace('landed ct=' + video.currentTime.toFixed(3) + ' pos=' + t.pos.toFixed(3) + ' err=' + seekErr.toFixed(3) + ' after=' + lat.toFixed(3) + 's');
   if (seekErr > HOLD_ABOVE) {
     // Ahead: freeze here and let the schedule arrive.
     holding = true; holds++; stepping = 0;
     video.pause();
+    trace('hold at ct=' + video.currentTime.toFixed(3));
   } else if (seekErr < -SEEK_ABOVE) {
     // Behind, and by more than a seek should miss: a keyframe player. Ask
     // for a point further ahead until a landing is ahead of the target.
@@ -241,6 +279,7 @@ function checkSettle(raw) {
   var lost = Math.max(0, Math.min(2, settle.drift - raw));
   stall = stall === 0 ? lost : stall * 0.7 + lost * 0.3;
   settle = null;
+  trace('settled: lost ' + lost.toFixed(3) + ' -> stall ' + stall.toFixed(3));
 }
 
 // Resume a hold: the schedule has reached the frame we are paused on.
@@ -271,11 +310,13 @@ function checkHold(pos) {
 function resume() {
   resumeTimer = null;
   if (!holding) return;
+  var pos = target().pos;
   holding = false;
   // The first hold resumes blind to how long play() takes; once that is
   // measured, one more hold is allowed to take the residual out. One, so
   // a jittery player cannot be made to freeze every few seconds.
   refine = stall === 0;
+  trace('resume ct=' + video.currentTime.toFixed(3) + ' pos=' + pos.toFixed(3) + ' playLat=' + playLatency.toFixed(3) + ' stall=' + stall.toFixed(3));
   playIssuedAt = Date.now();
   video.play().catch(function () {});
   watchResume(video.currentTime);
@@ -287,6 +328,7 @@ function setRate(want) {
   if (want === rateValue || now - rateSetAt < RATE_HOLD) return;
   video.playbackRate = want;
   rateValue = want; rateSetAt = now;
+  trace('rate set ' + want);
   // Prove it took: after two seconds at this rate the clock should have
   // advanced at it. A player that ignores the rate advances at 1.0.
   rateProbe = want === 1 ? null : {wall: now, ct: video.currentTime, rate: want};
@@ -300,10 +342,16 @@ function checkRateProbe() {
   if (measured < 0) return;                                  // wrapped; inconclusive
   if (Math.abs(measured - rateValue) < 0.03) rateWorks = true;
   else if (Math.abs(measured - 1) < 0.02) rateWorks = false; // ignored
+  trace('rate probe: asked ' + rateValue + ' measured ' + measured.toFixed(3) + ' -> ' + rateWorks);
 }
 
 function correct(pos) {
   if (holding) { checkHold(pos); return; }
+  // A seek whose `seeked` never comes (some TV players) would wait forever.
+  if (!isNaN(seekTarget) && Date.now() - seekIssuedAt > 5000) {
+    trace('no seeked event in 5 s; treating as landed');
+    seekTarget = NaN; stepping = 0;
+  }
   if (stepping || video.seeking || video.readyState < 2) return;
   var raw = wrapDrift(video.currentTime - pos);            // + means ahead
   lastDrift = raw;
@@ -314,7 +362,10 @@ function correct(pos) {
 
   var threshold = keyframeMode ? KEYFRAME_TOL : SEEK_ABOVE;
   if (refine && rateWorks === false && Math.abs(smooth) > HOLD_ABOVE) threshold = HOLD_ABOVE;
-  if (Math.abs(raw) > threshold && now - lastSeekAt > SEEK_COOLDOWN) {
+  // Both the sample and the average: a player that reports currentTime in
+  // coarse steps produces single samples a step off, and a seek on one of
+  // those is a hop for nothing.
+  if (Math.abs(raw) > threshold && Math.abs(smooth) > threshold && now - lastSeekAt > SEEK_COOLDOWN) {
     stepping = 0; refine = false;
     seekTo(pos);
     return;

@@ -98,6 +98,16 @@ struct FileEntry {
     size: u64,
 }
 
+/// A viewer's own account of what its player did, sent only when opened
+/// with `?trace`. Written to the log so a TV across the world can be read
+/// from here; bounded, since anyone can post it.
+#[derive(Deserialize)]
+struct TraceBody {
+    id: String,
+    ua: String,
+    lines: Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct ScheduleRequest {
     file: String,
@@ -322,6 +332,25 @@ async fn clear_schedule(
     Ok(Json(app.view()))
 }
 
+async fn post_trace(Json(body): Json<TraceBody>) -> StatusCode {
+    if body.lines.len() > 200 {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    let id: String = body
+        .id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect();
+    let ua: String = body.ua.chars().take(200).collect();
+    info!(target: "viewer", "{id} ua {ua}");
+    for line in &body.lines {
+        let line: String = line.chars().take(300).collect();
+        info!(target: "viewer", "{id} {line}");
+    }
+    StatusCode::NO_CONTENT
+}
+
 fn router(app: App) -> Router {
     let media = ServeDir::new(&app.media_dir);
     Router::new()
@@ -331,6 +360,7 @@ fn router(app: App) -> Router {
         .route("/api/events", get(events))
         .route("/api/files", get(list_files))
         .route("/api/schedule", post(set_schedule).delete(clear_schedule))
+        .route("/api/trace", post(post_trace))
         .nest_service("/media", media)
         .layer(TraceLayer::new_for_http())
         .with_state(app)
