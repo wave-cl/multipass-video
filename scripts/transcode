@@ -9,19 +9,36 @@
 #   frames, so the interval bounds how far off a join lands and how long the
 #   viewer's "hold" freezes while the schedule catches up.
 # - Capped bitrate so a client that joins mid-file can fetch faster than
-#   it plays; AAC stereo 48 kHz; the moov atom at the front (+faststart) so
-#   the browser can seek into the middle before the whole file has arrived.
+#   it plays; the moov atom at the front (+faststart) so the browser can
+#   seek into the middle before the whole file has arrived.
+# - Audio as AAC-LC with the source's channel layout kept up to 5.1 (7.1
+#   folds to 5.1: browsers and TVs decode six AAC channels reliably, eight
+#   less so). AAC because Chrome and Firefox will not play E-AC-3/DTS in
+#   MP4 at all; a surround source is re-encoded, not passed through.
 # - Subtitle and data streams dropped; browsers do not render them in MP4.
 set -eu
 in=${1:?input}; out=${2:?output.mp4}
 case "$out" in *.mp4) ;; *) echo "output must be .mp4" >&2; exit 1 ;; esac
+
+channels=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of default=nw=1:nk=1 "$in" || echo 0)
+case "$channels" in
+  0|"") audio="-an"; echo "no audio stream" ;;
+  1)    audio="-c:a aac -ar 48000 -b:a 96k" ;;
+  2)    audio="-c:a aac -ar 48000 -b:a 160k" ;;
+  3|4|5) audio="-c:a aac -ar 48000 -b:a 256k" ;;
+  6)    audio="-c:a aac -ac 6 -ar 48000 -b:a 384k" ;;   # -ac 6 also tags the layout as 5.1
+  *)    audio="-c:a aac -ac 6 -ar 48000 -b:a 384k"; echo "$channels channels: folding to 5.1" ;;
+esac
+echo "audio: $channels channel(s) -> $audio"
+
+# shellcheck disable=SC2086  # $audio is a deliberate word list
 ffmpeg -hide_banner -nostdin -y -i "$in" \
   -map 0:v:0 -map '0:a:0?' -sn -dn \
   -vf "scale='min(1920,iw)':-2" \
   -c:v libx264 -preset slow -crf 20 -profile:v high -level 4.1 -pix_fmt yuv420p \
   -force_key_frames 'expr:gte(t,n_forced*2)' -sc_threshold 0 -x264-params open-gop=0 \
   -maxrate 8M -bufsize 16M \
-  -c:a aac -ac 2 -ar 48000 -b:a 160k \
+  $audio \
   -movflags +faststart \
   "$out"
 echo

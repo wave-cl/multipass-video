@@ -91,7 +91,8 @@ ffmpeg -i input.mkv -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart 
 
 `scripts/transcode input output.mp4` produces the form that streams best
 here -- H.264 High 4.1, at most 1080p, a keyframe every 2 s, capped
-bitrate, AAC stereo, `+faststart` -- from anything ffmpeg reads.
+bitrate, AAC keeping the source's channels up to 5.1 (7.1 folds to 5.1),
+`+faststart` -- from anything ffmpeg reads.
 
 A 30 s test clip with a running counter, useful for checking sync by eye:
 
