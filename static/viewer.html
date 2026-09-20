@@ -109,7 +109,8 @@ function apply(s) {
   if (s.version === version) return;
   version = s.version;
   schedule = s.schedule;
-  duration = NaN; loadError = false;
+  duration = NaN; loadError = false; loadErrors = 0;
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   resetController();
   if (schedule) {
     video.src = '/media/' + encodeURIComponent(schedule.file);
@@ -121,8 +122,26 @@ function apply(s) {
   }
 }
 
-video.addEventListener('loadedmetadata', function () { duration = video.duration; });
-video.addEventListener('error', function () { loadError = true; });
+video.addEventListener('loadedmetadata', function () { duration = video.duration; loadErrors = 0; });
+
+// A media error is usually a blip -- the server restarting, the network
+// dropping -- and a page that gives up on it strands the viewer until they
+// reload. So reload the element ourselves, backing off, and only call the
+// file unplayable after it has failed several times in a row.
+var loadErrors = 0, retryTimer = null;
+video.addEventListener('error', function () {
+  loadError = true; loadErrors++;
+  trace('media error code=' + (video.error && video.error.code) + ' attempt ' + loadErrors);
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = setTimeout(function () {
+    retryTimer = null;
+    if (!schedule) return;
+    loadError = false; duration = NaN;
+    resetController();
+    video.src = '/media/' + encodeURIComponent(schedule.file) + '?r=' + loadErrors;
+    video.load();
+  }, Math.min(30000, 2000 * Math.pow(2, loadErrors - 1)));
+});
 
 var es = new EventSource('/api/events');
 es.addEventListener('state', function (e) { apply(JSON.parse(e.data)); });
@@ -431,7 +450,11 @@ function tick() {
     case 'idle':    pause(); show('Nothing scheduled', 'Waiting for the administrator'); break;
     case 'waiting': pause(); show('Starting in ' + fmt(t.in), schedule.file); break;
     case 'loading': pause(); show('Loading…', schedule.file); break;
-    case 'error':   pause(); show('Cannot play this file', schedule.file + ' — is it H.264/AAC MP4 or WebM?'); break;
+    case 'error':
+      pause();
+      if (loadErrors < 4) show('Reconnecting…', schedule.file);
+      else show('Cannot play this file', schedule.file + ' — is it H.264/AAC MP4 or WebM? (still retrying)');
+      break;
     case 'ended':   pause(); show('Stream ended', schedule.file); break;
     case 'playing':
       ensurePlaying();
