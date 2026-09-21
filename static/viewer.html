@@ -11,15 +11,37 @@
   #video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;background:#000}
   #overlay{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.65);text-align:center;padding:16px}
   #overlay h1{font-size:28px;font-weight:600;margin:0 0 14px}
-  #overlay.quiet{background:#000}
-  #overlay.quiet h1{font-size:16px;font-weight:400;opacity:.6;letter-spacing:.06em;animation:breathe 6s ease-in-out infinite}
-  @keyframes breathe{0%,100%{opacity:.35}50%{opacity:.7}}
+  /* Intermission card: an 80s public-access "please stand by" -- colour
+     bars, scanlines, chroma-fringed chunky type, a CRT vignette. All CSS. */
+  #intermission{position:absolute;top:0;left:0;right:0;bottom:0;overflow:hidden;background:#000;font-family:Impact,"Arial Black","Helvetica Neue",Arial,sans-serif}
+  #intermission .bars{position:absolute;top:0;left:0;right:0;bottom:0;
+    background:linear-gradient(90deg,#c0c0c0 0 14.28%,#c0c000 0 28.57%,#00c0c0 0 42.85%,#00c000 0 57.14%,#c000c0 0 71.42%,#c00000 0 85.71%,#0000c0 0 100%);
+    filter:saturate(1.3) contrast(1.05)}
+  #intermission .bars:after{content:"";position:absolute;left:0;right:0;bottom:0;height:24%;
+    background:linear-gradient(90deg,#0000c0 0 14.28%,#131313 0 28.57%,#c000c0 0 42.85%,#131313 0 57.14%,#00c0c0 0 71.42%,#131313 0 85.71%,#c0c0c0 0 100%)}
+  #intermission .band{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);padding:5vh 0;text-align:center;
+    background:rgba(0,0,40,.82);border-top:6px solid #fff;border-bottom:6px solid #fff;box-shadow:0 0 0 6px #000 inset}
+  #intermission h1{margin:0;font-size:12vw;line-height:1;font-weight:900;letter-spacing:.06em;color:#ffe83d;
+    text-shadow:-3px 0 rgba(255,0,60,.85),3px 0 rgba(0,255,255,.85),6px 6px 0 #000,0 0 30px rgba(255,232,61,.35);
+    animation:jitter 7s steps(1,end) infinite}
+  #intermission p{margin:2vh 0 0;font-size:3.2vw;letter-spacing:.35em;color:#fff;text-transform:uppercase;font-family:"Courier New",Courier,monospace;font-weight:700;
+    text-shadow:2px 0 rgba(255,0,60,.7),-2px 0 rgba(0,255,255,.7),3px 3px 0 #000}
+  #intermission .scan{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;
+    background:repeating-linear-gradient(0deg,rgba(0,0,0,.28) 0 2px,rgba(0,0,0,0) 2px 4px)}
+  #intermission .vig{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;
+    background:radial-gradient(ellipse at center,rgba(0,0,0,0) 55%,rgba(0,0,0,.75) 100%)}
+  #intermission .noise{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;opacity:.10;mix-blend-mode:screen}
+  #intermission .roll{position:absolute;left:0;right:0;height:14%;top:-14%;pointer-events:none;
+    background:linear-gradient(180deg,rgba(255,255,255,0),rgba(255,255,255,.10) 50%,rgba(255,255,255,0));animation:roll 11s linear infinite}
+  @keyframes roll{to{top:114%}}
+  @keyframes jitter{0%,96%,100%{transform:none}97%{transform:translateX(3px) skewX(-2deg)}98%{transform:translateX(-2px)}}
+  @media (max-width:700px){#intermission h1{font-size:16vw}#intermission p{font-size:4.5vw;letter-spacing:.2em}}
   #overlay p{margin:0 0 14px;opacity:.75;font-variant-numeric:tabular-nums}
   button{font:inherit;padding:10px 18px;border-radius:8px;border:0;background:#fff;color:#000;cursor:pointer}
   #controls{position:absolute;left:12px;top:12px;transition:opacity .3s}
   #controls button{background:rgba(255,255,255,.9);margin-right:8px}
   #hud{position:absolute;right:12px;bottom:12px;font:12px ui-monospace,Menlo,monospace;opacity:.45;background:rgba(0,0,0,.6);padding:4px 8px;border-radius:4px;white-space:pre;transition:opacity .3s}
-  @media (min-width:1600px){#hud{font-size:22px}#overlay h1{font-size:44px}#overlay.quiet h1{font-size:26px}#overlay p,button{font-size:22px}}
+  @media (min-width:1600px){#hud{font-size:22px}#overlay h1{font-size:44px}#overlay p,button{font-size:22px}}
   /* Idle in fullscreen: nothing but the picture. */
   body.idle #controls,body.idle #hud{opacity:0;pointer-events:none}
   body.idle{cursor:none}
@@ -28,6 +50,14 @@
 </head>
 <body>
 <video id="video" playsinline preload="auto"></video>
+<div id="intermission" class="hidden">
+  <div class="bars"></div>
+  <svg class="noise" xmlns="http://www.w3.org/2000/svg" width="100%" height="100%"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" stitchTiles="stitch"/><feColorMatrix type="saturate" values="0"/></filter><rect width="100%" height="100%" filter="url(#n)"/></svg>
+  <div class="band"><h1>Intermission</h1><p>We'll be right back</p></div>
+  <div class="roll"></div>
+  <div class="scan"></div>
+  <div class="vig"></div>
+</div>
 <div id="overlay"><h1 id="title">Connecting…</h1><p id="sub"></p><button id="join" class="hidden">Join</button></div>
 <div id="controls"><button id="fullscreen">Fullscreen</button><button id="unmute" class="hidden">Unmute</button></div>
 <div id="hud"></div>
@@ -256,7 +286,7 @@ var seeks = 0, holds = 0, lastDrift = 0, smooth = null, backoff = 0;
 var keyframeMode, lastSeekAt, seekTarget, seekIssuedAt, seekErr, seekLatency, stepping;
 var holding, playIssuedAt, playLatency, holdWorks, resumeTimer = null;
 var stall, settle;   // the clock's stall after a seek or resume, and the pending measurement of it
-var rateWorks, rateValue, rateSetAt, rateProbe;
+var rateWorks, rateValue, rateSetAt, rateProbe, rateFlushes;
 
 function resetController() {
   keyframeMode = false; lastSeekAt = -Infinity; seekTarget = NaN; seekIssuedAt = 0;
@@ -264,7 +294,7 @@ function resetController() {
   holding = false; playIssuedAt = 0; playLatency = 0; stall = 0; settle = null; backoff = 0;
   if (resumeTimer) { clearTimeout(resumeTimer); resumeTimer = null; }
   holdWorks = SAMSUNG ? false : null;
-  rateWorks = SAMSUNG ? false : null; rateValue = 1; rateSetAt = 0; rateProbe = null;
+  rateWorks = SAMSUNG ? false : null; rateValue = 1; rateSetAt = 0; rateProbe = null; rateFlushes = 0;
 }
 resetController();
 
@@ -389,12 +419,19 @@ function setRate(want) {
   rateValue = want; rateSetAt = now;
   trace('rate set ' + want);
   // A player that flushes on a rate change says so with `waiting` at once.
+  // Twice, before believing it: a `waiting` can also be plain buffering
+  // that happened to land there, and a desktop wrongly written off is a
+  // desktop corrected by seeks alone.
   var onWaiting = function () {
     video.removeEventListener('waiting', onWaiting);
     if (Date.now() - rateSetAt < 400 && rateWorks !== false) {
-      rateWorks = false; rateProbe = null;
-      trace('waiting right after a rate change: player flushes on it; rate is off');
-      if (rateValue !== 1) { video.playbackRate = 1; rateValue = 1; }
+      rateFlushes++;
+      trace('waiting right after a rate change (' + rateFlushes + ')');
+      if (rateFlushes >= 2) {
+        rateWorks = false; rateProbe = null;
+        trace('player flushes on rate changes; rate is off');
+        if (rateValue !== 1) { video.playbackRate = 1; rateValue = 1; }
+      }
     }
   };
   video.addEventListener('waiting', onWaiting);
@@ -458,6 +495,7 @@ function correct(pos) {
 function tick() {
   var t = target();
   var hud = '';
+  if (t.state !== 'intermission') $('intermission').classList.add('hidden');
   switch (t.state) {
     case 'idle':    pause(); show('Nothing scheduled', ''); break;
     case 'waiting': pause(); show('Starting in ' + fmt(t.in), ''); break;
@@ -470,8 +508,8 @@ function tick() {
     case 'ended':   pause(); show('Stream ended', ''); break;
     case 'intermission':
       ensurePlaying();
-      if (needGesture) { show("We'll be right back", '', true); break; }
-      show("We'll be right back", '', false, true);
+      $('intermission').classList.remove('hidden');
+      if (needGesture) show('Intermission', 'Tap for sound', true); else hide();
       hud = 'intermission ' + fmt((serverNow() - intermission) / 1000) + '\n';
       break;
     case 'playing':
@@ -492,9 +530,8 @@ function tick() {
 }
 
 function pause() { if (!video.paused) video.pause(); }
-function show(title, sub, join, quiet) {
+function show(title, sub, join) {
   $('overlay').classList.remove('hidden');
-  $('overlay').classList.toggle('quiet', !!quiet);
   $('title').textContent = title; $('sub').textContent = sub || '';
   $('join').classList.toggle('hidden', !join);
 }
