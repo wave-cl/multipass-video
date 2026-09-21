@@ -97,6 +97,13 @@ jobs:
           shared-key: release-${{ matrix.os }}
           save-if: false
 
+      # A tag with a failing test must not become a release. ci.yml runs the
+      # tests on every push, but a tag push runs only this workflow, and
+      # v0.3.15 went out with a red test that way.
+      - name: Tests
+        if: runner.os == 'Linux' && matrix.machine == 'x86_64'
+        run: cargo test
+
       - name: Build
         run: cargo build --release
 
