@@ -202,7 +202,7 @@ function apply(s) {
     video.pause();
     music.currentTime = 0;
     music.muted = video.muted;
-    musicTries = 0;
+    musicTries = 0; musicNextTry = 0;
     fadeInMusic();
     ensureMusic();
     var tm = Date.now();
@@ -286,27 +286,45 @@ function ensurePlaying() {
     .catch(function (e) {
       playPending = false;
       trace('video.play() refused (' + (e && e.name) + ': ' + (e && e.message) + ') muted=' + video.muted + ' rs=' + video.readyState + ' try ' + playTries);
+      if (e && e.name !== 'NotAllowedError') { playTries = 0; return; }   // the element's problem; the error handler reloads it
       if (!video.muted) { video.muted = true; ensurePlaying(); }   // retry muted, once
       else { needGesture = true; trace('asking for a tap: video refused muted'); }
     });
 }
 $('join').onclick = function () {
   needGesture = false; playTries = 0; musicTries = 0; video.muted = false; music.muted = false;
-  if (intermission) { stopFade(); music.volume = 1; music.play().catch(function () {}); } else video.play().catch(function () {});
+  if (intermission) {
+    stopFade(); music.volume = 1; musicTries = 0; musicNextTry = 0;
+    music.play().catch(function () { music.src = '/intermission-audio'; music.load(); music.play().catch(function () {}); });
+  } else video.play().catch(function () {});
 };
 $('unmute').onclick = function () { video.muted = false; music.muted = false; };
 
-var musicPending = false, musicTries = 0;
+// Only NotAllowedError -- the browser wants a click -- earns the tap
+// prompt, and only after a muted retry. Anything else is the element's
+// problem, not the viewer's: Samsung's TV browser releases an idle audio
+// element's source while the film plays, and play() then says "no
+// supported sources"; a tap changes nothing, reloading the element does.
+var musicPending = false, musicTries = 0, musicNextTry = 0;
 function ensureMusic() {
-  if (!music.paused || musicPending || needGesture) return;
-  if (++musicTries > 2) { needGesture = true; trace('asking for a tap: music'); return; }
+  if (!music.paused || musicPending || needGesture || Date.now() < musicNextTry) return;
   musicPending = true;
+  musicTries++;
   music.play().then(function () { musicPending = false; musicTries = 0; })
     .catch(function (e) {
       musicPending = false;
-      trace('music.play() refused (' + (e && e.name) + ': ' + (e && e.message) + ') muted=' + music.muted + ' rs=' + music.readyState + ' try ' + musicTries);
-      if (!music.muted) { music.muted = true; ensureMusic(); }   // retry muted, once
-      else { needGesture = true; trace('asking for a tap: music refused muted'); }
+      var name = e && e.name;
+      trace('music.play() refused (' + name + ': ' + (e && e.message) + ') muted=' + music.muted + ' rs=' + music.readyState + ' try ' + musicTries);
+      if (name === 'NotAllowedError') {
+        if (!music.muted) { music.muted = true; ensureMusic(); }   // retry muted, once
+        else { needGesture = true; trace('asking for a tap: music refused muted'); }
+        return;
+      }
+      // Reload the element and try again, backing off; never a tap.
+      music.src = '/intermission-audio';
+      music.load();
+      musicNextTry = Date.now() + Math.min(8000, 500 * Math.pow(2, musicTries - 1));
+      trace('music element reloaded; next try in ' + (musicNextTry - Date.now()) + 'ms');
     });
 }
 

@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>repro</title>
+<script>
+// Samsung's TV browser: an idle audio element's source is released, play()
+// says NotSupportedError until the element is reloaded. Count both.
+fetch('/').then(r => r.text()).then(html => {
+  const shim = `<script>
+    window.__plays = 0; window.__loads = 0; window.__dead = true;
+    const realPlay = HTMLMediaElement.prototype.play, realLoad = HTMLMediaElement.prototype.load;
+    HTMLMediaElement.prototype.load = function () { if (this.id === 'music' && window.__plays > 0) { window.__loads++; window.__dead = false; } return realLoad.call(this); };
+    HTMLMediaElement.prototype.play = function () {
+      if (this.id !== 'music') return realPlay.call(this);
+      window.__plays++;
+      if (window.__dead) return Promise.reject(new DOMException('The element has no supported sources.', 'NotSupportedError'));
+      return realPlay.call(this);
+    };
+  <\/script>`;
+  document.open(); document.write(html.replace('<script>', shim + '<script>')); document.close();
+});
+</script>
