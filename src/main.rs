@@ -469,9 +469,12 @@ async fn start_intermission(
     Ok(Json(app.view()))
 }
 
-/// End the intermission. A film that had started resumes where it was
-/// paused: its start moves forward by the intermission's length. One that
-/// had not started yet keeps its countdown.
+/// End the intermission. A film that had started resumes a little before
+/// where it was paused -- `REWIND_MS` back, so the audience picks the thread
+/// up -- its start moving forward by the intermission's length plus that.
+/// Never before the film's own beginning. One that had not started yet
+/// keeps its countdown.
+const REWIND_MS: i64 = 5_000;
 async fn end_intermission(
     State(app): State<App>,
     headers: HeaderMap,
@@ -483,7 +486,7 @@ async fn end_intermission(
         if let Some(since) = s.intermission_since_ms.take() {
             if let Some(sch) = &mut s.schedule {
                 if sch.start_ms <= since {
-                    sch.start_ms += now - since;
+                    sch.start_ms = (sch.start_ms + (now - since) + REWIND_MS).min(now);
                 }
             }
         }
@@ -813,8 +816,35 @@ mod tests {
         assert_eq!(call(&app, req).await.0, StatusCode::OK);
         let s = state(&app).await;
         assert!(s["intermission_since_ms"].is_null());
+        // Moved forward by the intermission's length (50 ms+) plus the 5 s rewind.
         let shifted = s["schedule"]["start_ms"].as_i64().unwrap() - started;
-        assert!((50..2000).contains(&shifted), "start moved by {shifted} ms");
+        assert!(
+            (5_050..7_000).contains(&shifted),
+            "start moved by {shifted} ms"
+        );
+
+        // A film paused 2 s in cannot rewind 5 s: it resumes from its start.
+        let just_started = now_ms() - 2_000;
+        let body = format!(r#"{{"file":"f.mp4","start_ms":{just_started},"loop":false}}"#);
+        let req = admin(Request::post("/api/schedule"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.into())
+            .unwrap();
+        assert_eq!(call(&app, req).await.0, StatusCode::OK);
+        let req = admin(Request::post("/api/intermission"))
+            .body(Default::default())
+            .unwrap();
+        call(&app, req).await;
+        let req = admin(Request::delete("/api/intermission"))
+            .body(Default::default())
+            .unwrap();
+        call(&app, req).await;
+        let s = state(&app).await;
+        let start = s["schedule"]["start_ms"].as_i64().unwrap();
+        assert!(
+            start <= now_ms() && start > now_ms() - 500,
+            "resumes from the beginning, not before it"
+        );
 
         // A film that has not started keeps its countdown.
         let future = now_ms() + 100_000;

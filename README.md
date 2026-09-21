@@ -34,13 +34,14 @@ cargo install --path .
 
 The admin page's **Intermission** button pauses the film for everyone: the
 viewer shows a "We'll be right back" card and plays music on a loop;
-ending it resumes the film where it was paused. Both switches are
+ending it resumes the film 5 s before where it was paused, so the
+audience picks the thread up (the schedule's start moves forward by the
+intermission's length plus 5 s, never past the film's own beginning; a
+film that had not started yet keeps its countdown). Both switches are
 instant: the film stays loaded and merely pauses under the card, the
-music is fetched whole when the page loads and kept locally, and the
-card is CSS (the schedule's start
-moves forward by the intermission's length; a film that had not started
-yet keeps its countdown). The music is a built-in ambient pad unless the
-media directory holds an `intermission.mp3` (or `.m4a`, `.ogg`, `.opus`,
+music is loaded when the page loads and cached, and the card is CSS,
+painted in advance. The music is a built-in ambient pad unless the media
+directory holds an `intermission.mp3` (or `.m4a`, `.ogg`, `.opus`,
 `.wav`, `.flac`), which is used instead after a restart. Viewers are never
 shown the file's name -- only the countdown, the picture, and the HUD.
 
