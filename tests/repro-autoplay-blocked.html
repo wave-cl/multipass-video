@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>repro</title>
+<script>
+// Load the real viewer page, but with play() refused the way a browser
+// that blocks autoplay refuses it. Count the calls; give up refusing after
+// 3000 so the tab survives if the page loops.
+fetch('/').then(r => r.text()).then(html => {
+  const shim = `<script>
+    window.__plays = 0;
+    const realPlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function () {
+      window.__plays++;
+      // refuse forever
+      const e = new DOMException('play() failed because the user didn\\'t interact with the document first.', 'NotAllowedError');
+      return Promise.reject(e);
+    };
+  <\/script>`;
+  document.open(); document.write(html.replace('<script>', shim + '<script>')); document.close();
+});
+</script>

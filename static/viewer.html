@@ -172,6 +172,7 @@ function apply(s) {
   if (s.version === version) return;
   var was = intermission;
   version = s.version;
+  playTries = 0; musicTries = 0;
   schedule = s.schedule;
   intermission = s.intermission_since_ms;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
@@ -200,6 +201,8 @@ function apply(s) {
     requestAnimationFrame(function () { requestAnimationFrame(function () { trace('card painted ' + (Date.now() - t0) + 'ms after the event'); }); });
     video.pause();
     music.currentTime = 0;
+    music.muted = video.muted;
+    musicTries = 0;
     fadeInMusic();
     ensureMusic();
     var tm = Date.now();
@@ -268,33 +271,39 @@ es.addEventListener('state', function (e) { apply(JSON.parse(e.data)); });
 // --- playback: getting it started -----------------------------------------
 // The user's gesture is needed once for unmuted playback. We try muted
 // autoplay first; if even that is refused we show a Join button.
-var needGesture = false, playPending = false;
+var needGesture = false, playPending = false, playTries = 0;
 
+// A refused play() is retried once, muted; refused again, the viewer is
+// asked to tap. Never more than that: a retry that re-copied the mute
+// state from the other element once spun forever on a browser that
+// blocks autoplay (Brave by default, Chrome before a click), starving
+// every timer on the page -- 'Connecting…' for good, then a dead tab.
 function ensurePlaying() {
   if (!video.paused || playPending || needGesture || holding) return;
+  if (++playTries > 2) { needGesture = true; return; }
   playPending = true;
-  video.play().then(function () { playPending = false; })
+  video.play().then(function () { playPending = false; playTries = 0; })
     .catch(function () {
       playPending = false;
-      if (!video.muted) { video.muted = true; ensurePlaying(); }   // retry muted
+      if (!video.muted) { video.muted = true; ensurePlaying(); }   // retry muted, once
       else needGesture = true;
     });
 }
 $('join').onclick = function () {
-  needGesture = false; video.muted = false; music.muted = false;
+  needGesture = false; playTries = 0; musicTries = 0; video.muted = false; music.muted = false;
   if (intermission) { stopFade(); music.volume = 1; music.play().catch(function () {}); } else video.play().catch(function () {});
 };
 $('unmute').onclick = function () { video.muted = false; music.muted = false; };
 
-var musicPending = false;
+var musicPending = false, musicTries = 0;
 function ensureMusic() {
   if (!music.paused || musicPending || needGesture) return;
+  if (++musicTries > 2) { needGesture = true; return; }
   musicPending = true;
-  music.muted = video.muted;
-  music.play().then(function () { musicPending = false; })
+  music.play().then(function () { musicPending = false; musicTries = 0; })
     .catch(function () {
       musicPending = false;
-      if (!music.muted) { music.muted = true; ensureMusic(); }   // retry muted
+      if (!music.muted) { music.muted = true; ensureMusic(); }   // retry muted, once
       else needGesture = true;
     });
 }
@@ -608,7 +617,7 @@ function tick() {
       pause();
       ensureMusic();
       if (!$('intermission').classList.contains('on')) $('intermission').classList.add('on');
-      if (needGesture) show("We'll be right back", 'Tap for sound', true); else hide();
+      if (needGesture) show('Tap for sound', '', true); else hide();
       hud = 'intermission ' + fmt((serverNow() - intermission) / 1000) + (music.paused ? '  (music not playing)' : '') + '\n';
       break;
     case 'playing':
