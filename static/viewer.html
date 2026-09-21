@@ -280,13 +280,14 @@ var needGesture = false, playPending = false, playTries = 0;
 // every timer on the page -- 'Connecting…' for good, then a dead tab.
 function ensurePlaying() {
   if (!video.paused || playPending || needGesture || holding) return;
-  if (++playTries > 2) { needGesture = true; return; }
+  if (++playTries > 2) { needGesture = true; trace('asking for a tap: video'); return; }
   playPending = true;
   video.play().then(function () { playPending = false; playTries = 0; })
-    .catch(function () {
+    .catch(function (e) {
       playPending = false;
+      trace('video.play() refused (' + (e && e.name) + ': ' + (e && e.message) + ') muted=' + video.muted + ' rs=' + video.readyState + ' try ' + playTries);
       if (!video.muted) { video.muted = true; ensurePlaying(); }   // retry muted, once
-      else needGesture = true;
+      else { needGesture = true; trace('asking for a tap: video refused muted'); }
     });
 }
 $('join').onclick = function () {
@@ -298,13 +299,14 @@ $('unmute').onclick = function () { video.muted = false; music.muted = false; };
 var musicPending = false, musicTries = 0;
 function ensureMusic() {
   if (!music.paused || musicPending || needGesture) return;
-  if (++musicTries > 2) { needGesture = true; return; }
+  if (++musicTries > 2) { needGesture = true; trace('asking for a tap: music'); return; }
   musicPending = true;
   music.play().then(function () { musicPending = false; musicTries = 0; })
-    .catch(function () {
+    .catch(function (e) {
       musicPending = false;
+      trace('music.play() refused (' + (e && e.name) + ': ' + (e && e.message) + ') muted=' + music.muted + ' rs=' + music.readyState + ' try ' + musicTries);
       if (!music.muted) { music.muted = true; ensureMusic(); }   // retry muted, once
-      else needGesture = true;
+      else { needGesture = true; trace('asking for a tap: music refused muted'); }
     });
 }
 
