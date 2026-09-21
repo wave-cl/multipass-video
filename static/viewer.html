@@ -21,11 +21,9 @@
     background:linear-gradient(90deg,#0000c0 0 14.28%,#131313 0 28.57%,#c000c0 0 42.85%,#131313 0 57.14%,#00c0c0 0 71.42%,#131313 0 85.71%,#c0c0c0 0 100%)}
   #intermission .band{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);padding:5vh 0;text-align:center;
     background:rgba(0,0,40,.82);border-top:6px solid #fff;border-bottom:6px solid #fff;box-shadow:0 0 0 6px #000 inset}
-  #intermission h1{margin:0;font-size:12vw;line-height:1;font-weight:900;letter-spacing:.06em;color:#ffe83d;
+  #intermission h1{margin:0;font-size:8vw;line-height:1.05;font-weight:900;letter-spacing:.05em;color:#ffe83d;
     text-shadow:-3px 0 rgba(255,0,60,.85),3px 0 rgba(0,255,255,.85),6px 6px 0 #000,0 0 30px rgba(255,232,61,.35);
     animation:jitter 7s steps(1,end) infinite}
-  #intermission p{margin:2vh 0 0;font-size:3.2vw;letter-spacing:.35em;color:#fff;text-transform:uppercase;font-family:"Courier New",Courier,monospace;font-weight:700;
-    text-shadow:2px 0 rgba(255,0,60,.7),-2px 0 rgba(0,255,255,.7),3px 3px 0 #000}
   #intermission .scan{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;
     background:repeating-linear-gradient(0deg,rgba(0,0,0,.28) 0 2px,rgba(0,0,0,0) 2px 4px)}
   #intermission .vig{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;
@@ -35,7 +33,7 @@
     background:linear-gradient(180deg,rgba(255,255,255,0),rgba(255,255,255,.10) 50%,rgba(255,255,255,0));animation:roll 11s linear infinite}
   @keyframes roll{to{top:114%}}
   @keyframes jitter{0%,96%,100%{transform:none}97%{transform:translateX(3px) skewX(-2deg)}98%{transform:translateX(-2px)}}
-  @media (max-width:700px){#intermission h1{font-size:16vw}#intermission p{font-size:4.5vw;letter-spacing:.2em}}
+  @media (max-width:700px){#intermission h1{font-size:12vw}}
   #overlay p{margin:0 0 14px;opacity:.75;font-variant-numeric:tabular-nums}
   button{font:inherit;padding:10px 18px;border-radius:8px;border:0;background:#fff;color:#000;cursor:pointer}
   #controls{position:absolute;left:12px;top:12px;transition:opacity .3s}
@@ -53,7 +51,7 @@
 <div id="intermission" class="hidden">
   <div class="bars"></div>
   <svg class="noise" xmlns="http://www.w3.org/2000/svg" width="100%" height="100%"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" stitchTiles="stitch"/><feColorMatrix type="saturate" values="0"/></filter><rect width="100%" height="100%" filter="url(#n)"/></svg>
-  <div class="band"><h1>Intermission</h1><p>We'll be right back</p></div>
+  <div class="band"><h1>We'll be right back</h1></div>
   <div class="roll"></div>
   <div class="scan"></div>
   <div class="vig"></div>
@@ -509,7 +507,7 @@ function tick() {
     case 'intermission':
       ensurePlaying();
       $('intermission').classList.remove('hidden');
-      if (needGesture) show('Intermission', 'Tap for sound', true); else hide();
+      if (needGesture) show("We'll be right back", 'Tap for sound', true); else hide();
       hud = 'intermission ' + fmt((serverNow() - intermission) / 1000) + '\n';
       break;
     case 'playing':
