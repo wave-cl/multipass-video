@@ -51,8 +51,22 @@ fi
 caddy validate --config /tmp/Caddyfile --adapter caddyfile
 install -m 644 /tmp/Caddyfile /etc/caddy/Caddyfile
 rm /tmp/Caddyfile
+# Caddy 2.x on Debian 13 has panicked inside `reload` (a Go runtime
+# "missing cancel error"), and its unit does not restart on failure -- the
+# site was down until somebody looked. So: restart on failure, and check
+# after the reload that it is actually up.
+install -d /etc/systemd/system/caddy.service.d
+cat > /etc/systemd/system/caddy.service.d/restart.conf <<'UNIT'
+[Service]
+Restart=on-failure
+RestartSec=2
+UNIT
+systemctl daemon-reload
 systemctl enable --now caddy
 systemctl reload caddy || systemctl restart caddy
+sleep 2
+systemctl is-active --quiet caddy || { echo "caddy is not running after reload; restarting"; systemctl restart caddy; sleep 2; }
+systemctl is-active --quiet caddy || { echo "caddy failed to start" >&2; journalctl -u caddy -n 20 --no-pager -o cat >&2; exit 1; }
 
 sleep 1
 systemctl is-active multipass-video caddy
