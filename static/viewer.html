@@ -48,6 +48,7 @@
 </head>
 <body>
 <video id="video" playsinline preload="auto"></video>
+<audio id="music" loop preload="auto"></audio>
 <div id="intermission" class="hidden">
   <div class="bars"></div>
   <svg class="noise" xmlns="http://www.w3.org/2000/svg" width="100%" height="100%"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" stitchTiles="stitch"/><feColorMatrix type="saturate" values="0"/></filter><rect width="100%" height="100%" filter="url(#n)"/></svg>
@@ -63,11 +64,20 @@
 'use strict';
 var $ = function (id) { return document.getElementById(id); };
 var video = $('video');
+var music = $('music');
+
+// The intermission music is fetched whole at load and kept as a local
+// blob, so an intermission starts the instant it is called, not after a
+// download. The card itself is CSS; there is nothing else to fetch.
+fetch('/intermission-audio').then(function (r) { return r.blob(); })
+  .then(function (b) { music.src = URL.createObjectURL(b); music.load(); })
+  .catch(function () { music.src = '/intermission-audio'; });
 
 // --- what the server says -------------------------------------------------
 var schedule = null;      // {file, start_ms, loop} or null
 var intermission = null;  // when it began (server ms), or null
 var version = -1;
+var loadedFile = null;    // what the video element holds
 var duration = NaN;       // of the loaded file, seconds
 var loadError = false;
 
@@ -139,26 +149,39 @@ if (TRACE) {
 // --- schedule changes -----------------------------------------------------
 function apply(s) {
   if (s.version === version) return;
+  var was = intermission;
   version = s.version;
   schedule = s.schedule;
   intermission = s.intermission_since_ms;
-  duration = NaN; loadError = false; loadErrors = 0;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   resetController();
-  if (intermission) {
-    // The music plays through the same element as the film, so it has
-    // whatever permission to make sound the viewer already gave.
-    video.src = '/intermission-audio';
-    video.loop = true;
-    video.load();
+  // The film stays in the element across an intermission: it pauses under
+  // the card and resumes from the same frame, with no reload and no black.
+  // Only a different file is loaded.
+  var want = schedule ? schedule.file : null;
+  if (want !== loadedFile) {
+    loadedFile = want;
+    duration = NaN; loadError = false; loadErrors = 0;
+    if (want) {
+      video.src = '/media/' + encodeURIComponent(want);
+      video.loop = schedule.loop;   // the element wraps by itself; we only correct
+      video.load();
+    } else {
+      video.removeAttribute('src');
+      video.load();
+    }
   } else if (schedule) {
-    video.src = '/media/' + encodeURIComponent(schedule.file);
-    video.loop = schedule.loop;   // the element wraps by itself; we only correct
-    video.load();
-  } else {
-    video.removeAttribute('src');
-    video.load();
+    video.loop = schedule.loop;
   }
+  if (intermission && !was) {
+    trace('intermission: pausing at ' + video.currentTime.toFixed(3));
+    video.pause();
+    music.currentTime = 0;
+  } else if (!intermission && was) {
+    trace('intermission over: resuming');
+    music.pause();
+  }
+  tick();   // now, not at the next tick
 }
 
 video.addEventListener('loadedmetadata', function () { duration = video.duration; loadErrors = 0; });
@@ -174,10 +197,10 @@ video.addEventListener('error', function () {
   if (retryTimer) clearTimeout(retryTimer);
   retryTimer = setTimeout(function () {
     retryTimer = null;
-    if (!schedule && !intermission) return;
+    if (!schedule) return;
     loadError = false; duration = NaN;
     resetController();
-    video.src = (intermission ? '/intermission-audio' : '/media/' + encodeURIComponent(schedule.file)) + '?r=' + loadErrors;
+    video.src = '/media/' + encodeURIComponent(schedule.file) + '?r=' + loadErrors;
     video.load();
   }, Math.min(30000, 2000 * Math.pow(2, loadErrors - 1)));
 });
@@ -200,8 +223,24 @@ function ensurePlaying() {
       else needGesture = true;
     });
 }
-$('join').onclick = function () { needGesture = false; video.muted = false; video.play().catch(function () {}); };
-$('unmute').onclick = function () { video.muted = false; };
+$('join').onclick = function () {
+  needGesture = false; video.muted = false; music.muted = false;
+  if (intermission) music.play().catch(function () {}); else video.play().catch(function () {});
+};
+$('unmute').onclick = function () { video.muted = false; music.muted = false; };
+
+var musicPending = false;
+function ensureMusic() {
+  if (!music.paused || musicPending || needGesture || !music.src) return;
+  musicPending = true;
+  music.muted = video.muted;
+  music.play().then(function () { musicPending = false; })
+    .catch(function () {
+      musicPending = false;
+      if (!music.muted) { music.muted = true; ensureMusic(); }   // retry muted
+      else needGesture = true;
+    });
+}
 
 // --- fullscreen -----------------------------------------------------------
 // The whole page, not the element, so the buttons and HUD stay reachable.
@@ -493,7 +532,10 @@ function correct(pos) {
 function tick() {
   var t = target();
   var hud = '';
-  if (t.state !== 'intermission') $('intermission').classList.add('hidden');
+  if (t.state !== 'intermission') {
+    if (!$('intermission').classList.contains('hidden')) $('intermission').classList.add('hidden');
+    if (!music.paused) music.pause();
+  }
   switch (t.state) {
     case 'idle':    pause(); show('Nothing scheduled', ''); break;
     case 'waiting': pause(); show('Starting in ' + fmt(t.in), ''); break;
@@ -505,10 +547,11 @@ function tick() {
       break;
     case 'ended':   pause(); show('Stream ended', ''); break;
     case 'intermission':
-      ensurePlaying();
-      $('intermission').classList.remove('hidden');
+      pause();
+      ensureMusic();
+      if ($('intermission').classList.contains('hidden')) $('intermission').classList.remove('hidden');
       if (needGesture) show("We'll be right back", 'Tap for sound', true); else hide();
-      hud = 'intermission ' + fmt((serverNow() - intermission) / 1000) + '\n';
+      hud = 'intermission ' + fmt((serverNow() - intermission) / 1000) + (music.paused ? '  (music not playing)' : '') + '\n';
       break;
     case 'playing':
       ensurePlaying();
@@ -522,7 +565,7 @@ function tick() {
         (keyframeMode ? '  keyframe player' : '') + (holdWorks === false ? '  no holds' : '') + (backoff ? '  backoff ' + backoff : '') + '\n';
       break;
   }
-  $('unmute').classList.toggle('hidden', !((t.state === 'playing' || t.state === 'intermission') && video.muted && !needGesture));
+  $('unmute').classList.toggle('hidden', !((t.state === 'playing' && video.muted || t.state === 'intermission' && music.muted) && !needGesture));
   $('hud').textContent = hud + 'clock offset ' + offset.toFixed(0) + 'ms  rtt ' + (isNaN(offsetRtt) ? '?' : offsetRtt + 'ms') +
     '  ' + ua();
 }
