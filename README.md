@@ -44,6 +44,16 @@ media directory holds an `intermission.mp3` (or `.m4a`, `.ogg`, `.opus`,
 `.wav`, `.flac`), which is used instead after a restart. Viewers are never
 shown the file's name -- only the countdown, the picture, and the HUD.
 
+## Browsers and sound
+
+A browser only starts sound on a page the viewer has clicked. The viewer
+tries to play, retries muted, and then shows "Tap for sound" with a
+button; after one click on the page, everything that follows plays with
+sound on its own. Allowing autoplay for the site removes the tap. In
+Brave, Shields override that allowance -- put Shields down for the site
+(there is nothing third-party on the page for them to block). Samsung's
+TV browser needs no tap.
+
 ## Who can watch
 
 With `--viewer-key-file` (or `MULTIPASS_VIEWER_KEY_FILE`) set, every page,
