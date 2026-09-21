@@ -34,9 +34,9 @@ cargo install --path .
 
 The admin page's **Intermission** button pauses the film for everyone: the
 viewer shows a "We'll be right back" card and plays music on a loop;
-ending it resumes the film 5 s before where it was paused, so the
+ending it resumes the film 10 s before where it was paused, so the
 audience picks the thread up (the schedule's start moves forward by the
-intermission's length plus 5 s, never past the film's own beginning; a
+intermission's length plus 10 s, never past the film's own beginning; a
 film that had not started yet keeps its countdown). Both switches are
 instant: the film stays loaded and merely pauses under the card, the
 music is loaded when the page loads and cached, and the card is CSS,

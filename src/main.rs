@@ -816,14 +816,14 @@ mod tests {
         assert_eq!(call(&app, req).await.0, StatusCode::OK);
         let s = state(&app).await;
         assert!(s["intermission_since_ms"].is_null());
-        // Moved forward by the intermission's length (50 ms+) plus the 5 s rewind.
+        // Moved forward by the intermission's length (50 ms+) plus the 10 s rewind.
         let shifted = s["schedule"]["start_ms"].as_i64().unwrap() - started;
         assert!(
-            (5_050..7_000).contains(&shifted),
+            (10_050..12_000).contains(&shifted),
             "start moved by {shifted} ms"
         );
 
-        // A film paused 2 s in cannot rewind 5 s: it resumes from its start.
+        // A film paused 2 s in cannot rewind 10 s: it resumes from its start.
         let just_started = now_ms() - 2_000;
         let body = format!(r#"{{"file":"f.mp4","start_ms":{just_started},"loop":false}}"#);
         let req = admin(Request::post("/api/schedule"))
