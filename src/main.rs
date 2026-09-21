@@ -474,7 +474,7 @@ async fn start_intermission(
 /// up -- its start moving forward by the intermission's length plus that.
 /// Never before the film's own beginning. One that had not started yet
 /// keeps its countdown.
-const REWIND_MS: i64 = 5_000;
+const REWIND_MS: i64 = 10_000;
 async fn end_intermission(
     State(app): State<App>,
     headers: HeaderMap,
