@@ -176,7 +176,8 @@ function apply(s) {
   if (intermission && !was) {
     trace('intermission: pausing at ' + video.currentTime.toFixed(3));
     video.pause();
-    stopFade(); music.volume = 1; music.currentTime = 0;
+    music.currentTime = 0;
+    fadeInMusic();
   } else if (!intermission && was) {
     trace('intermission over: resuming');
     fadeOutMusic();
@@ -184,23 +185,30 @@ function apply(s) {
   tick();   // now, not at the next tick
 }
 
-// The music fades out under the resuming film rather than cutting. iOS
-// Safari ignores writes to volume -- there the fade would be two seconds
-// of full-volume music over the film, so it cuts instead.
+// The music fades in as the card appears and out under the resuming film
+// rather than cutting. iOS Safari ignores writes to volume -- there a fade
+// out would be seconds of full-volume music over the film, so it cuts.
 var FADE_MS = 2500, fadeTimer = null;
 function stopFade() { if (fadeTimer) { clearInterval(fadeTimer); fadeTimer = null; } }
-function fadeOutMusic() {
+function volumeWritable() { music.volume = 0.5; var ok = music.volume === 0.5; music.volume = 1; return ok; }
+function fade(from, to, done) {
   stopFade();
-  if (music.paused) return;
-  music.volume = 0.5;
-  if (music.volume !== 0.5) { music.pause(); music.volume = 1; return; }
-  music.volume = 1;
+  if (!volumeWritable()) { done(); return; }
   var t0 = Date.now();
+  music.volume = from;
   fadeTimer = setInterval(function () {
-    var k = 1 - (Date.now() - t0) / FADE_MS;
-    if (k <= 0) { stopFade(); music.pause(); music.volume = 1; return; }
-    music.volume = k * k;   // ease out: quick at first, gentle at the end
+    var k = Math.min(1, (Date.now() - t0) / FADE_MS);
+    // Ease: a fade in rises gently at first, a fade out drops quickly at
+    // first -- both spend their time at the quiet end, where the ear is.
+    var e = to > from ? k * k : 1 - (1 - k) * (1 - k);
+    music.volume = from + (to - from) * e;
+    if (k >= 1) { stopFade(); done(); }
   }, 50);
+}
+function fadeInMusic() { fade(0, 1, function () { music.volume = 1; }); }
+function fadeOutMusic() {
+  if (music.paused) { stopFade(); return; }
+  fade(music.volume, 0, function () { music.pause(); music.volume = 1; });
 }
 
 video.addEventListener('loadedmetadata', function () { duration = video.duration; loadErrors = 0; });
