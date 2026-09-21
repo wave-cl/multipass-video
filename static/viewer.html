@@ -176,11 +176,11 @@ function apply(s) {
   schedule = s.schedule;
   intermission = s.intermission_since_ms;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-  resetController();
   // The film stays in the element across an intermission: it pauses under
   // the card and resumes from the same frame, with no reload and no black.
   // Only a different file is loaded.
   var want = schedule ? schedule.file : null;
+  if (want !== loadedFile) resetController(); else resetTransient();
   if (want !== loadedFile) {
     loadedFile = want;
     duration = NaN; loadError = false; loadErrors = 0;
@@ -412,13 +412,23 @@ var holding, playIssuedAt, playLatency, holdWorks, resumeTimer = null;
 var stall, settle;   // the clock's stall after a seek or resume, and the pending measurement of it
 var rateWorks, rateValue, rateSetAt, rateProbe, rateFlushes;
 
-function resetController() {
-  keyframeMode = false; lastSeekAt = -Infinity; seekTarget = NaN; seekIssuedAt = 0;
-  seekErr = NaN; seekLatency = 0; stepping = 0; smooth = null;
-  holding = false; playIssuedAt = 0; playLatency = 0; stall = 0; settle = null; backoff = 0;
+// What the controller has learned about the player -- its seek latency
+// and post-seek stall, whether it honours the rate, whether it can hold,
+// whether it seeks to keyframes -- is kept across schedule changes of the
+// same file: a resume after an intermission is a seek like any other,
+// and a seek aimed with stall=0 on a player that stalls 1.5 s undershoots
+// and needs a second seek. Only a different file starts from nothing.
+function resetTransient() {
+  lastSeekAt = -Infinity; seekTarget = NaN; seekIssuedAt = 0; seekErr = NaN; stepping = 0; smooth = null;
+  holding = false; playIssuedAt = 0; settle = null; backoff = 0;
   if (resumeTimer) { clearTimeout(resumeTimer); resumeTimer = null; }
+  rateValue = 1; rateSetAt = 0; rateProbe = null;
+}
+function resetController() {
+  resetTransient();
+  keyframeMode = false; seekLatency = 0; playLatency = 0; stall = 0;
   holdWorks = SAMSUNG ? false : null;
-  rateWorks = SAMSUNG ? false : null; rateValue = 1; rateSetAt = 0; rateProbe = null; rateFlushes = 0;
+  rateWorks = SAMSUNG ? false : null; rateFlushes = 0;
 }
 resetController();
 
