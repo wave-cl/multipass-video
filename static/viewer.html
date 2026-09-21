@@ -187,6 +187,10 @@ function apply(s) {
     video.pause();
     music.currentTime = 0;
     fadeInMusic();
+    ensureMusic();
+    var tm = Date.now();
+    var onPlaying = function () { music.removeEventListener('playing', onPlaying); trace('music playing ' + (Date.now() - tm) + 'ms after the event'); };
+    music.addEventListener('playing', onPlaying);
   } else if (!intermission && was) {
     trace('intermission over: resuming');
     var t1 = Date.now();
@@ -196,30 +200,31 @@ function apply(s) {
   tick();   // now, not at the next tick
 }
 
-// The music fades in as the card appears and out under the resuming film
-// rather than cutting. iOS Safari ignores writes to volume -- there a fade
-// out would be seconds of full-volume music over the film, so it cuts.
-var FADE_MS = 2500, fadeTimer = null;
+// The music comes in with the card -- a short, front-loaded fade so it
+// is audible at once without a click -- and fades out slowly under the
+// resuming film. iOS Safari ignores writes to volume -- there a fade out
+// would be seconds of full-volume music over the film, so it cuts.
+var FADE_IN_MS = 500, FADE_OUT_MS = 2500, fadeTimer = null;
 function stopFade() { if (fadeTimer) { clearInterval(fadeTimer); fadeTimer = null; } }
 function volumeWritable() { music.volume = 0.5; var ok = music.volume === 0.5; music.volume = 1; return ok; }
-function fade(from, to, done) {
+function fade(from, to, ms, done) {
   stopFade();
   if (!volumeWritable()) { done(); return; }
   var t0 = Date.now();
   music.volume = from;
   fadeTimer = setInterval(function () {
-    var k = Math.min(1, (Date.now() - t0) / FADE_MS);
-    // Ease: a fade in rises gently at first, a fade out drops quickly at
-    // first -- both spend their time at the quiet end, where the ear is.
-    var e = to > from ? k * k : 1 - (1 - k) * (1 - k);
+    var k = Math.min(1, (Date.now() - t0) / ms);
+    // Both curves move fast at the start: the fade in is audible at once,
+    // the fade out gets out of the film's way at once.
+    var e = 1 - (1 - k) * (1 - k);
     music.volume = from + (to - from) * e;
     if (k >= 1) { stopFade(); done(); }
   }, 50);
 }
-function fadeInMusic() { fade(0, 1, function () { music.volume = 1; }); }
+function fadeInMusic() { fade(0, 1, FADE_IN_MS, function () { music.volume = 1; }); }
 function fadeOutMusic() {
   if (music.paused) { stopFade(); return; }
-  fade(music.volume, 0, function () { music.pause(); music.volume = 1; });
+  fade(music.volume, 0, FADE_OUT_MS, function () { music.pause(); music.volume = 1; });
 }
 
 video.addEventListener('loadedmetadata', function () { duration = video.duration; loadErrors = 0; });
