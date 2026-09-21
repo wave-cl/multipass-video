@@ -72,13 +72,17 @@
 var $ = function (id) { return document.getElementById(id); };
 var video = $('video');
 var music = $('music');
+var TRACE_EARLY = /[?&]trace/.test(location.search) || /Tizen|SMART-TV|SamsungBrowser|Web0S/i.test(navigator.userAgent);
 
-// The intermission music is fetched whole at load and kept as a local
-// blob, so an intermission starts the instant it is called, not after a
-// download. The card itself is CSS; there is nothing else to fetch.
-fetch('/intermission-audio').then(function (r) { return r.blob(); })
-  .then(function (b) { music.src = URL.createObjectURL(b); music.load(); })
-  .catch(function () { music.src = '/intermission-audio'; });
+// The intermission music is loaded at page load (preload=auto, and the
+// server marks it cacheable for a day), so a later intermission starts
+// from the browser's cache. It plays straight from the element's own
+// source rather than a blob: a blob had to download whole before a
+// joiner heard anything, and WebKit is unreliable with blob media of
+// this size. The card itself is CSS; there is nothing else to fetch.
+music.src = '/intermission-audio';
+music.load();
+if (TRACE_EARLY) music.addEventListener('canplaythrough', function () { trace('music preloaded, ' + (music.buffered.length ? music.buffered.end(music.buffered.length - 1).toFixed(0) : '?') + ' s buffered'); });
 
 // --- what the server says -------------------------------------------------
 var schedule = null;      // {file, start_ms, loop} or null
@@ -274,7 +278,7 @@ $('unmute').onclick = function () { video.muted = false; music.muted = false; };
 
 var musicPending = false;
 function ensureMusic() {
-  if (!music.paused || musicPending || needGesture || !music.src) return;
+  if (!music.paused || musicPending || needGesture) return;
   musicPending = true;
   music.muted = video.muted;
   music.play().then(function () { musicPending = false; })

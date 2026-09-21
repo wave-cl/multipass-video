@@ -1,6 +1,6 @@
 [package]
 name = "multipass-video"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 description = "Schedule a video file on disk to stream to every viewer in sync"
 
@@ -14,13 +14,13 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs", "set-header", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"

@@ -34,6 +34,7 @@ use tokio::sync::watch;
 use tokio_stream::{wrappers::WatchStream, Stream, StreamExt};
 use tower_http::{
     services::{ServeDir, ServeFile},
+    set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
 use tracing::{info, warn};
@@ -557,7 +558,15 @@ fn router(app: App) -> Router {
         )
         .route_service(
             "/intermission-audio",
-            intermission_service(&app.intermission_audio),
+            // Cacheable for a day: the viewer preloads it at page load and
+            // a later intermission then plays from the browser's cache.
+            // ServeFile's Last-Modified lets the browser revalidate.
+            tower::ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("public, max-age=86400"),
+                ))
+                .service(intermission_service(&app.intermission_audio)),
         )
         .nest_service("/media", media)
         .layer(middleware::from_fn_with_state(app.clone(), viewer_gate))
