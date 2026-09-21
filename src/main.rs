@@ -32,12 +32,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio_stream::{wrappers::WatchStream, Stream, StreamExt};
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 
 const VIEWER_HTML: &str = include_str!("../static/viewer.html");
 const ADMIN_HTML: &str = include_str!("../static/admin.html");
 const LOGIN_HTML: &str = include_str!("../static/login.html");
+/// The intermission music when the media dir has no `intermission.*`.
+const INTERMISSION_AUDIO: &[u8] = include_bytes!("../static/intermission.m4a");
 const VIEWER_COOKIE: &str = "mp_viewer";
 
 /// Extensions browsers can generally play natively.
@@ -92,6 +97,10 @@ struct Schedule {
 struct Persisted {
     version: u64,
     schedule: Option<Schedule>,
+    /// When the intermission began, if one is on. The film is paused for
+    /// its length: ending it moves the schedule's start forward by that.
+    #[serde(default)]
+    intermission_since_ms: Option<i64>,
 }
 
 /// What clients see: the state plus the server clock for offset estimation.
@@ -100,6 +109,7 @@ struct StateView {
     server_now_ms: i64,
     version: u64,
     schedule: Option<Schedule>,
+    intermission_since_ms: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -135,6 +145,7 @@ struct LoginForm {
 struct Inner {
     media_dir: PathBuf,
     state_file: PathBuf,
+    intermission_audio: PathBuf,
     admin_token: String,
     /// The viewer key and the cookie value that proves it (its SHA-256, hex).
     viewer: Option<(String, String)>,
@@ -182,6 +193,7 @@ impl Inner {
             server_now_ms: now_ms(),
             version: s.version,
             schedule: s.schedule.clone(),
+            intermission_since_ms: s.intermission_since_ms,
         }
     }
 
@@ -200,10 +212,18 @@ impl Inner {
 
     /// Replace the schedule, persist it, and wake every SSE subscriber.
     fn set(&self, schedule: Option<Schedule>) -> Result<u64, std::io::Error> {
+        self.update(|s| {
+            s.schedule = schedule;
+            s.intermission_since_ms = None;
+        })
+    }
+
+    /// Change the state under the lock, bump the version, persist, wake.
+    fn update(&self, f: impl FnOnce(&mut Persisted)) -> Result<u64, std::io::Error> {
         let snapshot = {
             let mut s = self.state.lock().unwrap();
+            f(&mut s);
             s.version += 1;
-            s.schedule = schedule;
             s.clone()
         };
         persist(&self.state_file, &snapshot)?;
@@ -431,6 +451,76 @@ async fn clear_schedule(
     Ok(Json(app.view()))
 }
 
+async fn start_intermission(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<Json<StateView>, (StatusCode, String)> {
+    app.require_admin(&headers)
+        .map_err(|s| (s, "admin token required".into()))?;
+    let now = now_ms();
+    app.update(|s| {
+        if s.intermission_since_ms.is_none() {
+            s.intermission_since_ms = Some(now);
+        }
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    info!("intermission started");
+    Ok(Json(app.view()))
+}
+
+/// End the intermission. A film that had started resumes where it was
+/// paused: its start moves forward by the intermission's length. One that
+/// had not started yet keeps its countdown.
+async fn end_intermission(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<Json<StateView>, (StatusCode, String)> {
+    app.require_admin(&headers)
+        .map_err(|s| (s, "admin token required".into()))?;
+    let now = now_ms();
+    app.update(|s| {
+        if let Some(since) = s.intermission_since_ms.take() {
+            if let Some(sch) = &mut s.schedule {
+                if sch.start_ms <= since {
+                    sch.start_ms += now - since;
+                }
+            }
+        }
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    info!("intermission ended");
+    Ok(Json(app.view()))
+}
+
+/// The music: `intermission.*` in the media dir if the operator put one
+/// there, else the built-in pad, written next to the state file so it can
+/// be served with range support like any other media.
+fn intermission_audio_path(media_dir: &Path, state_file: &Path) -> std::io::Result<PathBuf> {
+    for ext in ["mp3", "m4a", "aac", "ogg", "opus", "wav", "flac"] {
+        let p = media_dir.join(format!("intermission.{ext}"));
+        if p.is_file() {
+            info!("intermission music: {}", p.display());
+            return Ok(p);
+        }
+    }
+    let p = state_file.with_file_name("intermission-default.m4a");
+    if std::fs::read(&p).ok().as_deref() != Some(INTERMISSION_AUDIO) {
+        std::fs::write(&p, INTERMISSION_AUDIO)?;
+    }
+    Ok(p)
+}
+
+/// `.m4a` guesses to `audio/m4a`, which Safari does not recognise; AAC in
+/// an MP4 container is `audio/mp4`.
+fn intermission_service(path: &Path) -> ServeFile {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("m4a") | Some("aac") => {
+            ServeFile::new_with_mime(path, &"audio/mp4".parse::<mime::Mime>().unwrap())
+        }
+        _ => ServeFile::new(path),
+    }
+}
+
 async fn post_trace(Json(body): Json<TraceBody>) -> StatusCode {
     if body.lines.len() > 200 {
         return StatusCode::PAYLOAD_TOO_LARGE;
@@ -461,6 +551,14 @@ fn router(app: App) -> Router {
         .route("/api/files", get(list_files))
         .route("/api/schedule", post(set_schedule).delete(clear_schedule))
         .route("/api/trace", post(post_trace))
+        .route(
+            "/api/intermission",
+            post(start_intermission).delete(end_intermission),
+        )
+        .route_service(
+            "/intermission-audio",
+            intermission_service(&app.intermission_audio),
+        )
         .nest_service("/media", media)
         .layer(middleware::from_fn_with_state(app.clone(), viewer_gate))
         .layer(TraceLayer::new_for_http())
@@ -498,9 +596,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (notify, _) = watch::channel(state.version);
 
+    let intermission_audio = intermission_audio_path(&args.media_dir, &args.state_file)?;
     let app: App = Arc::new(Inner {
         media_dir: args.media_dir.clone(),
         state_file: args.state_file,
+        intermission_audio,
         admin_token,
         viewer,
         login_failures: Default::default(),
@@ -558,6 +658,7 @@ mod tests {
         let app: App = Arc::new(Inner {
             media_dir: dir.clone(),
             state_file: dir.join("state.json"),
+            intermission_audio: dir.join("intermission.m4a"),
             admin_token: "admin".into(),
             viewer: viewer_key.map(|k| (k.to_string(), cookie_value(k))),
             login_failures: Default::default(),
@@ -661,6 +762,76 @@ mod tests {
             "{:?}",
             t0.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn an_intermission_pauses_a_running_film_and_not_a_countdown() {
+        use http_body_util::BodyExt;
+        let app = test_app(None);
+        let admin =
+            |req: axum::http::request::Builder| req.header(header::AUTHORIZATION, "Bearer admin");
+        let state = |app: &Router| {
+            let app = app.clone();
+            async move {
+                use tower::ServiceExt;
+                let res = app.oneshot(get("/api/state")).await.unwrap();
+                let body = res.into_body().collect().await.unwrap().to_bytes();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        let dir = std::env::temp_dir().join(format!("multipass-test-{}", std::process::id()));
+        std::fs::write(dir.join("f.mp4"), b"x").unwrap();
+
+        // A film that started 100 s ago.
+        let started = now_ms() - 100_000;
+        let body = format!(r#"{{"file":"f.mp4","start_ms":{started},"loop":false}}"#);
+        let req = admin(Request::post("/api/schedule"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.into())
+            .unwrap();
+        assert_eq!(call(&app, req).await.0, StatusCode::OK);
+
+        let req = admin(Request::post("/api/intermission"))
+            .body(Default::default())
+            .unwrap();
+        assert_eq!(call(&app, req).await.0, StatusCode::OK);
+        let s = state(&app).await;
+        assert!(s["intermission_since_ms"].is_i64());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let req = admin(Request::delete("/api/intermission"))
+            .body(Default::default())
+            .unwrap();
+        assert_eq!(call(&app, req).await.0, StatusCode::OK);
+        let s = state(&app).await;
+        assert!(s["intermission_since_ms"].is_null());
+        let shifted = s["schedule"]["start_ms"].as_i64().unwrap() - started;
+        assert!((50..2000).contains(&shifted), "start moved by {shifted} ms");
+
+        // A film that has not started keeps its countdown.
+        let future = now_ms() + 100_000;
+        let body = format!(r#"{{"file":"f.mp4","start_ms":{future},"loop":false}}"#);
+        let req = admin(Request::post("/api/schedule"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.into())
+            .unwrap();
+        assert_eq!(call(&app, req).await.0, StatusCode::OK);
+        let req = admin(Request::post("/api/intermission"))
+            .body(Default::default())
+            .unwrap();
+        call(&app, req).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let req = admin(Request::delete("/api/intermission"))
+            .body(Default::default())
+            .unwrap();
+        call(&app, req).await;
+        let s = state(&app).await;
+        assert_eq!(s["schedule"]["start_ms"].as_i64().unwrap(), future);
+
+        // Without the token: refused.
+        let req = Request::post("/api/intermission")
+            .body(Default::default())
+            .unwrap();
+        assert_eq!(call(&app, req).await.0, StatusCode::UNAUTHORIZED);
     }
 
     #[test]

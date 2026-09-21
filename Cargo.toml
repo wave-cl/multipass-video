@@ -1,12 +1,13 @@
 [package]
 name = "multipass-video"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Schedule a video file on disk to stream to every viewer in sync"
 
 [dependencies]
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+mime = "0.3"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

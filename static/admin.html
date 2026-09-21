@@ -32,7 +32,8 @@
 <section>
   <h2>Now playing</h2>
   <div id="status">Connecting…</div>
-  <div style="margin-top:12px"><button id="stop" class="quiet">Stop</button> <a href="/" target="_blank" style="color:#9cf">open viewer ↗</a></div>
+  <div style="margin-top:12px"><button id="intermission">Intermission</button><button id="stop" class="quiet">Stop</button> <a href="/" target="_blank" style="color:#9cf">open viewer ↗</a></div>
+  <small>Intermission pauses the film for everyone and plays music; ending it resumes where it left off.</small>
 </section>
 
 <section>
@@ -88,6 +89,12 @@ $('form').addEventListener('submit', async e => {
   say(r.ok ? 'Scheduled' : `Refused: ${r.status} ${await r.text()}`, !r.ok);
 });
 
+$('intermission').onclick = async () => {
+  const on = state && state.intermission_since_ms;
+  const r = await fetch('/api/intermission', {method: on ? 'DELETE' : 'POST', headers: auth()});
+  say(r.ok ? (on ? 'Intermission over' : 'Intermission') : `Refused: ${r.status} ${await r.text()}`, !r.ok);
+};
+
 $('stop').onclick = async () => {
   const r = await fetch('/api/schedule', {method: 'DELETE', headers: auth()});
   say(r.ok ? 'Stopped' : `Refused: ${r.status} ${await r.text()}`, !r.ok);
@@ -101,13 +108,15 @@ es.onerror = () => { $('status').textContent = 'Disconnected — reconnecting…
 
 function render() {
   if (!state) return;
-  const s = state.schedule;
-  if (!s) { $('status').textContent = 'Nothing scheduled.'; return; }
+  const s = state.schedule, im = state.intermission_since_ms;
+  $('intermission').textContent = im ? `End intermission (${fmt((Date.now() + offset - im) / 1000)})` : 'Intermission';
+  let line = im ? `INTERMISSION, ${fmt((Date.now() + offset - im) / 1000)} so far\n` : '';
+  if (!s) { $('status').textContent = line + 'Nothing scheduled.'; return; }
   const t = (Date.now() + offset - s.start_ms) / 1000;
   const when = new Date(s.start_ms).toLocaleString();
-  $('status').textContent = t < 0
+  $('status').textContent = line + (t < 0
     ? `${s.file}\nstarts at ${when} (in ${fmt(-t)})${s.loop ? ', looping' : ''}`
-    : `${s.file}\nstarted ${when}, ${fmt(t)} ago${s.loop ? ', looping' : ''}`;
+    : `${s.file}\n${im ? 'paused at' : 'started ' + when + ','} ${fmt(im ? (im - s.start_ms) / 1000 : t)}${im ? ' in' : ' ago'}${s.loop ? ', looping' : ''}`);
 }
 setInterval(render, 500);
 

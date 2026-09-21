@@ -30,6 +30,17 @@ on Apple silicon — each holding the binary and this README. Or build it:
 cargo install --path .
 ```
 
+## Intermission
+
+The admin page's **Intermission** button pauses the film for everyone: the
+viewer goes black with a small "We'll be right back" and plays music on a
+loop; ending it resumes the film where it was paused (the schedule's start
+moves forward by the intermission's length; a film that had not started
+yet keeps its countdown). The music is a built-in ambient pad unless the
+media directory holds an `intermission.mp3` (or `.m4a`, `.ogg`, `.opus`,
+`.wav`, `.flac`), which is used instead after a restart. Viewers are never
+shown the file's name -- only the countdown, the picture, and the HUD.
+
 ## Who can watch
 
 With `--viewer-key-file` (or `MULTIPASS_VIEWER_KEY_FILE`) set, every page,
@@ -120,9 +131,13 @@ ffmpeg -f lavfi -i testsrc=size=640x360:rate=30 -f lavfi -i sine=frequency=440:s
 | GET | `/api/files` | admin | playable files in the media dir |
 | POST | `/api/schedule` | admin | `{file, start_ms?, loop?}` — `start_ms` absent means now |
 | DELETE | `/api/schedule` | admin | stop |
+| POST | `/api/intermission` | admin | pause the film for everyone, play music |
+| DELETE | `/api/intermission` | admin | resume where it was paused |
+| GET | `/intermission-audio` | – | the music, with range support |
 | GET | `/media/<file>` | – | the file, with range support |
 
-`schedule` is `{file, start_ms, loop}` or `null`. Admin calls send
+`schedule` is `{file, start_ms, loop}` or `null`; `intermission_since_ms` is
+set while an intermission is on. Admin calls send
 `Authorization: Bearer <token>`.
 
 ## Not done (yet)

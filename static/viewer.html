@@ -11,12 +11,15 @@
   #video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;background:#000}
   #overlay{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.65);text-align:center;padding:16px}
   #overlay h1{font-size:28px;font-weight:600;margin:0 0 14px}
+  #overlay.quiet{background:#000}
+  #overlay.quiet h1{font-size:16px;font-weight:400;opacity:.6;letter-spacing:.06em;animation:breathe 6s ease-in-out infinite}
+  @keyframes breathe{0%,100%{opacity:.35}50%{opacity:.7}}
   #overlay p{margin:0 0 14px;opacity:.75;font-variant-numeric:tabular-nums}
   button{font:inherit;padding:10px 18px;border-radius:8px;border:0;background:#fff;color:#000;cursor:pointer}
   #controls{position:absolute;left:12px;top:12px;transition:opacity .3s}
   #controls button{background:rgba(255,255,255,.9);margin-right:8px}
   #hud{position:absolute;right:12px;bottom:12px;font:12px ui-monospace,Menlo,monospace;opacity:.45;background:rgba(0,0,0,.6);padding:4px 8px;border-radius:4px;white-space:pre;transition:opacity .3s}
-  @media (min-width:1600px){#hud{font-size:22px}#overlay h1{font-size:44px}#overlay p,button{font-size:22px}}
+  @media (min-width:1600px){#hud{font-size:22px}#overlay h1{font-size:44px}#overlay.quiet h1{font-size:26px}#overlay p,button{font-size:22px}}
   /* Idle in fullscreen: nothing but the picture. */
   body.idle #controls,body.idle #hud{opacity:0;pointer-events:none}
   body.idle{cursor:none}
@@ -35,6 +38,7 @@ var video = $('video');
 
 // --- what the server says -------------------------------------------------
 var schedule = null;      // {file, start_ms, loop} or null
+var intermission = null;  // when it began (server ms), or null
 var version = -1;
 var duration = NaN;       // of the loaded file, seconds
 var loadError = false;
@@ -109,10 +113,17 @@ function apply(s) {
   if (s.version === version) return;
   version = s.version;
   schedule = s.schedule;
+  intermission = s.intermission_since_ms;
   duration = NaN; loadError = false; loadErrors = 0;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   resetController();
-  if (schedule) {
+  if (intermission) {
+    // The music plays through the same element as the film, so it has
+    // whatever permission to make sound the viewer already gave.
+    video.src = '/intermission-audio';
+    video.loop = true;
+    video.load();
+  } else if (schedule) {
     video.src = '/media/' + encodeURIComponent(schedule.file);
     video.loop = schedule.loop;   // the element wraps by itself; we only correct
     video.load();
@@ -135,10 +146,10 @@ video.addEventListener('error', function () {
   if (retryTimer) clearTimeout(retryTimer);
   retryTimer = setTimeout(function () {
     retryTimer = null;
-    if (!schedule) return;
+    if (!schedule && !intermission) return;
     loadError = false; duration = NaN;
     resetController();
-    video.src = '/media/' + encodeURIComponent(schedule.file) + '?r=' + loadErrors;
+    video.src = (intermission ? '/intermission-audio' : '/media/' + encodeURIComponent(schedule.file)) + '?r=' + loadErrors;
     video.load();
   }, Math.min(30000, 2000 * Math.pow(2, loadErrors - 1)));
 });
@@ -193,6 +204,7 @@ poke();
 // --- playback: staying in sync --------------------------------------------
 // Where the schedule says we should be right now.
 function target() {
+  if (intermission) return {state: 'intermission'};
   if (!schedule) return {state: 'idle'};
   var t = (serverNow() - schedule.start_ms) / 1000;
   if (t < 0) return {state: 'waiting', in: -t};
@@ -447,18 +459,24 @@ function tick() {
   var t = target();
   var hud = '';
   switch (t.state) {
-    case 'idle':    pause(); show('Nothing scheduled', 'Waiting for the administrator'); break;
-    case 'waiting': pause(); show('Starting in ' + fmt(t.in), schedule.file); break;
-    case 'loading': pause(); show('Loading…', schedule.file); break;
+    case 'idle':    pause(); show('Nothing scheduled', ''); break;
+    case 'waiting': pause(); show('Starting in ' + fmt(t.in), ''); break;
+    case 'loading': pause(); show('Loading…', ''); break;
     case 'error':
       pause();
-      if (loadErrors < 4) show('Reconnecting…', schedule.file);
-      else show('Cannot play this file', schedule.file + ' — is it H.264/AAC MP4 or WebM? (still retrying)');
+      if (loadErrors < 4) show('Reconnecting…', '');
+      else show('Cannot play this file', 'Is it H.264/AAC MP4 or WebM? (still retrying)');
       break;
-    case 'ended':   pause(); show('Stream ended', schedule.file); break;
+    case 'ended':   pause(); show('Stream ended', ''); break;
+    case 'intermission':
+      ensurePlaying();
+      if (needGesture) { show("We'll be right back", '', true); break; }
+      show("We'll be right back", '', false, true);
+      hud = 'intermission ' + fmt((serverNow() - intermission) / 1000) + '\n';
+      break;
     case 'playing':
       ensurePlaying();
-      if (needGesture) { show('Live', schedule.file, true); break; }
+      if (needGesture) { show('Live', '', true); break; }
       hide();
       correct(t.pos);
       hud = fmt(t.pos) + ' / ' + fmt(duration) + (schedule.loop ? ' ↻' : '') +
@@ -468,14 +486,15 @@ function tick() {
         (keyframeMode ? '  keyframe player' : '') + (holdWorks === false ? '  no holds' : '') + (backoff ? '  backoff ' + backoff : '') + '\n';
       break;
   }
-  $('unmute').classList.toggle('hidden', !(t.state === 'playing' && video.muted && !needGesture));
+  $('unmute').classList.toggle('hidden', !((t.state === 'playing' || t.state === 'intermission') && video.muted && !needGesture));
   $('hud').textContent = hud + 'clock offset ' + offset.toFixed(0) + 'ms  rtt ' + (isNaN(offsetRtt) ? '?' : offsetRtt + 'ms') +
     '  ' + ua();
 }
 
 function pause() { if (!video.paused) video.pause(); }
-function show(title, sub, join) {
+function show(title, sub, join, quiet) {
   $('overlay').classList.remove('hidden');
+  $('overlay').classList.toggle('quiet', !!quiet);
   $('title').textContent = title; $('sub').textContent = sub || '';
   $('join').classList.toggle('hidden', !join);
 }

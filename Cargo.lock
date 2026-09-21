@@ -481,11 +481,12 @@ dependencies = [
 
 [[package]]
 name = "multipass-video"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "axum",
  "clap",
  "http-body-util",
+ "mime",
  "rand",
  "serde",
  "serde_json",
