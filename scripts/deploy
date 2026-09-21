@@ -44,10 +44,21 @@ systemctl daemon-reload
 systemctl enable --now multipass-video
 systemctl restart multipass-video
 
-if ! command -v caddy >/dev/null; then
+# Caddy from its own repository, not Debian's: Debian 13's 2.6.2 is built
+# with a Go runtime that panics on every config reload ("context: internal
+# error: missing cancel error"), which took the site down at each deploy.
+if [ ! -f /etc/apt/sources.list.d/caddy-stable.list ]; then
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -q && apt-get install -y -q caddy
+  apt-get install -y -q debian-keyring debian-archive-keyring apt-transport-https curl gnupg >/dev/null
+  curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
+  apt-get update -q >/dev/null
 fi
+if ! command -v caddy >/dev/null || dpkg -s caddy 2>/dev/null | grep -q "^Version: 2\.6\."; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y -q caddy
+fi
+caddy version
 caddy validate --config /tmp/Caddyfile --adapter caddyfile
 install -m 644 /tmp/Caddyfile /etc/caddy/Caddyfile
 rm /tmp/Caddyfile
