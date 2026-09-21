@@ -176,12 +176,31 @@ function apply(s) {
   if (intermission && !was) {
     trace('intermission: pausing at ' + video.currentTime.toFixed(3));
     video.pause();
-    music.currentTime = 0;
+    stopFade(); music.volume = 1; music.currentTime = 0;
   } else if (!intermission && was) {
     trace('intermission over: resuming');
-    music.pause();
+    fadeOutMusic();
   }
   tick();   // now, not at the next tick
+}
+
+// The music fades out under the resuming film rather than cutting. iOS
+// Safari ignores writes to volume -- there the fade would be two seconds
+// of full-volume music over the film, so it cuts instead.
+var FADE_MS = 2500, fadeTimer = null;
+function stopFade() { if (fadeTimer) { clearInterval(fadeTimer); fadeTimer = null; } }
+function fadeOutMusic() {
+  stopFade();
+  if (music.paused) return;
+  music.volume = 0.5;
+  if (music.volume !== 0.5) { music.pause(); music.volume = 1; return; }
+  music.volume = 1;
+  var t0 = Date.now();
+  fadeTimer = setInterval(function () {
+    var k = 1 - (Date.now() - t0) / FADE_MS;
+    if (k <= 0) { stopFade(); music.pause(); music.volume = 1; return; }
+    music.volume = k * k;   // ease out: quick at first, gentle at the end
+  }, 50);
 }
 
 video.addEventListener('loadedmetadata', function () { duration = video.duration; loadErrors = 0; });
@@ -225,7 +244,7 @@ function ensurePlaying() {
 }
 $('join').onclick = function () {
   needGesture = false; video.muted = false; music.muted = false;
-  if (intermission) music.play().catch(function () {}); else video.play().catch(function () {});
+  if (intermission) { stopFade(); music.volume = 1; music.play().catch(function () {}); } else video.play().catch(function () {});
 };
 $('unmute').onclick = function () { video.muted = false; music.muted = false; };
 
@@ -534,7 +553,7 @@ function tick() {
   var hud = '';
   if (t.state !== 'intermission') {
     if (!$('intermission').classList.contains('hidden')) $('intermission').classList.add('hidden');
-    if (!music.paused) music.pause();
+    if (!music.paused && !fadeTimer) music.pause();
   }
   switch (t.state) {
     case 'idle':    pause(); show('Nothing scheduled', ''); break;
