@@ -26,7 +26,7 @@
 <section>
   <h2>Token</h2>
   <label>Admin token <input id="token" type="password" autocomplete="off" placeholder="contents of the admin-token file"></label>
-  <small>Kept in this tab's sessionStorage only.</small>
+  <small>Remembered by this browser until you <a href="#" id="forget" style="color:#9cf">forget it</a>.</small>
 </section>
 
 <section>
@@ -52,13 +52,21 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const tokenEl = $('token');
-tokenEl.value = sessionStorage.getItem('token') || '';
+// Remembered across tabs and restarts. Storage can be blocked (private
+// windows, some shields); then the token lives for the page only.
+const store = {
+  get() { try { return localStorage.getItem('token') || sessionStorage.getItem('token') || ''; } catch { return ''; } },
+  set(v) { try { localStorage.setItem('token', v); } catch { try { sessionStorage.setItem('token', v); } catch {} } },
+  clear() { try { localStorage.removeItem('token'); } catch {} try { sessionStorage.removeItem('token'); } catch {} },
+};
+tokenEl.value = store.get();
+$('forget').onclick = e => { e.preventDefault(); store.clear(); tokenEl.value = ''; $('file').innerHTML = '<option value="">— load files with a token —</option>'; say('Token forgotten'); };
 
 function auth() { return {'Authorization': 'Bearer ' + tokenEl.value.trim()}; }
 function say(text, err) { $('msg').textContent = text; $('msg').className = err ? 'err' : ''; }
 
 async function loadFiles() {
-  sessionStorage.setItem('token', tokenEl.value);
+  store.set(tokenEl.value);
   if (!tokenEl.value.trim()) return;
   const r = await fetch('/api/files', {headers: auth()});
   if (!r.ok) { say(r.status === 401 ? 'Token rejected' : 'Could not list files (' + r.status + ')', true); return; }
