@@ -149,6 +149,11 @@ struct StateView {
     schedule: Option<Schedule>,
     intermission_since_ms: Option<i64>,
     resume_at_ms: Option<i64>,
+    /// While an intermission is on: where in the playlist the film will
+    /// resume. Known as soon as it pauses, so a viewer can spend the
+    /// intermission filling its buffer there rather than the ten seconds
+    /// after someone presses the button.
+    resume_pos_ms: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -405,6 +410,11 @@ impl Inner {
             schedule: s.schedule.clone(),
             intermission_since_ms: s.intermission_since_ms,
             resume_at_ms: s.resume_at_ms,
+            // The same arithmetic end_intermission will do.
+            resume_pos_ms: s.intermission_since_ms.and_then(|since| {
+                let sch = s.schedule.as_ref()?;
+                (sch.start_ms <= since).then(|| (since - sch.start_ms - REWIND_MS).max(0))
+            }),
         }
     }
 

@@ -90,6 +90,7 @@ if (TRACE_EARLY) music.addEventListener('canplaythrough', function () { trace('m
 var schedule = null;      // {items, start_ms, loop, then} or null
 var intermission = null;  // when it began (server ms), or null
 var resumeAt = null;      // when the film starts again after one, or null
+var resumePos = null;     // ...and where in the film, known from the moment it pauses
 var version = -1;
 var loadedFile = null;    // the item the video element holds...
 var loadedSrc = null;     // ...and which rendition of it
@@ -117,6 +118,9 @@ var PRIME_UNDER_S = 2;    // buffered this little after parking: it is not filli
 var PRIME_NEEDS_S = 2.5;  // only worth starting with this long to go
 var PRIME_STOP_S = 1.5;   // back to the frame this long before the start
 var PRIME_ENOUGH_S = 12;  // or as soon as this much is in hand
+var primedBefore = false; // this player has needed priming once already
+var primeStartedAt = 0;
+var primedPos = null;     // ...and has a buffer sitting at this position
 var loadError = false;
 
 // --- clock ----------------------------------------------------------------
@@ -203,6 +207,7 @@ function apply(s) {
   schedule = s.schedule;
   intermission = s.intermission_since_ms;
   resumeAt = s.resume_at_ms;
+  resumePos = s.resume_pos_ms === null || s.resume_pos_ms === undefined ? null : s.resume_pos_ms / 1000;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   // Which file to hold is the clock's business, decided in tick(): a
   // playlist's item changes with time, not only with the schedule. The
@@ -278,7 +283,7 @@ function loadItem(it) {
   trace('item ' + (it.idx >= 0 ? (it.idx + 1) : 'then') + ' ' + loadedSrc +
     ' at ' + it.pos.toFixed(2) + ' of ' + it.dur.toFixed(2) + (it.loops ? ' (loops)' : '') +
     (loadedSrc !== it.file ? ' [lighter]' : ''));
-  loadedFile = it.file; itemDur = it.dur; itemLoops = !!it.loops;
+  loadedFile = it.file; itemDur = it.dur; itemLoops = !!it.loops; primedPos = null;
   duration = NaN; loadError = false; loadErrors = 0;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   if (boundaryTimer) { clearTimeout(boundaryTimer); boundaryTimer = null; }
@@ -444,8 +449,12 @@ function target() {
   // the countdown after an intermission. Inside the last few seconds every
   // viewer parks on the frame it will start from and fills its buffer
   // there, so they all begin together instead of each stuttering in.
-  var at = schedule.start_ms > now ? schedule.start_ms
-         : (resumeAt && resumeAt > now ? resumeAt : 0);
+  // A resume comes first: after one, the shifted start can still be in
+  // the future when the film resumes near the beginning of an item, and
+  // reading that as a fresh start parks everyone on the wrong frame for
+  // the length of the countdown.
+  var at = (resumeAt && resumeAt > now) ? resumeAt
+         : (schedule.start_ms > now ? schedule.start_ms : 0);
   if (at) {
     var left = (at - now) / 1000;
     var first = itemAt((at - schedule.start_ms) / 1000);
@@ -829,26 +838,12 @@ function tick() {
       // Nothing came in while parked: pull it through by playing muted,
       // out of sight, and go back to the frame before the start.
       if (!priming && prerollAt === t.at && video.readyState >= 1 &&
-          Date.now() - parkedAt > 1500 && t.in > PRIME_NEEDS_S && bufferedAhead() < PRIME_UNDER_S) {
-        priming = true; primeFrom = t.pos; primeMuted = video.muted;
-        video.muted = true;
-        $('overlay').classList.add('solid');
-        trace('preroll: priming -- nothing buffered while parked');
-        video.play().catch(function (e) {
-          priming = false; video.muted = primeMuted;
-          trace('preroll: priming refused (' + (e && e.name) + ')');
-        });
+          Date.now() - parkedAt > (primedBefore ? 300 : 1500) &&
+          t.in > PRIME_NEEDS_S && bufferedAhead() < PRIME_UNDER_S) {
+        startPriming(t.pos, 'preroll');
       }
-      if (priming && (t.in <= PRIME_STOP_S || bufferedFrom(primeFrom) >= PRIME_ENOUGH_S)) {
-        // Read what it pulled through before seeking: a seek empties the
-        // reported ranges for a moment, and this number is the whole point.
-        var got = bufferedFrom(primeFrom), why = t.in <= PRIME_STOP_S ? 'out of time' : 'enough';
-        priming = false;
-        video.pause();
-        video.currentTime = primeFrom;
-        video.muted = primeMuted;
-        $('overlay').classList.remove('solid');
-        trace('preroll: primed ' + got.toFixed(1) + 's (' + why + '), back to ' + primeFrom.toFixed(2));
+      if (priming && (t.in <= PRIME_STOP_S || bufferedFrom(primeFrom) >= primeTarget(primeFrom))) {
+        stopPriming(t.in <= PRIME_STOP_S ? 'out of time' : 'enough');
       }
       if (prerollAt === t.at && !prerollTimer && t.in * 1000 - playLatency * 1000 <= 400) {
         prerollTimer = setTimeout(function () {
@@ -879,12 +874,27 @@ function tick() {
       break;
     case 'ended':   pause(); show('Stream ended', ''); break;
     case 'intermission':
-      pause();
+      if (!priming) pause();
       ensureMusic();
+      // The resume point is known the moment the film pauses, and an
+      // intermission is minutes of nothing. Fill the buffer there now
+      // rather than in the ten seconds before it comes back.
+      if (resumePos !== null && video.readyState >= 1 && loadedFile) {
+        if (!priming && primedPos !== resumePos &&
+            serverNow() - intermission > 2000 &&
+            bufferedFrom(resumePos) < primeTarget(resumePos)) {
+          startPriming(resumePos, 'intermission');
+        } else if (priming && (bufferedFrom(primeFrom) >= primeTarget(primeFrom) ||
+                               Date.now() - primeStartedAt > 90000)) {
+          stopPriming(bufferedFrom(primeFrom) >= primeTarget(primeFrom) ? 'enough' : 'long enough');
+        }
+      }
       if (!$('intermission').classList.contains('on')) $('intermission').classList.add('on');
       $('iline').textContent = "We'll be right back";
       if (needGesture) show('Tap for sound', '', true); else hide();
-      hud = 'intermission ' + fmt((serverNow() - intermission) / 1000) + (music.paused ? '  (music not playing)' : '') + '\n';
+      hud = 'intermission ' + fmt((serverNow() - intermission) / 1000) +
+        (resumePos === null ? '' : ', back at ' + fmt(resumePos) + ' with ' + bufferedFrom(resumePos).toFixed(1) + 's ready') +
+        (priming ? ' (filling)' : '') + (music.paused ? '  (music not playing)' : '') + '\n';
       break;
     case 'playing':
       ensurePlaying();
@@ -927,6 +937,44 @@ function bufferedFrom(t) {
   return 0;
 }
 function bufferedAhead() { return bufferedFrom(video.currentTime); }
+
+// Pull data through at a position by playing it muted out of sight --
+// the only way to fill the buffer of a player that will not fill while
+// paused -- then settle back onto that exact frame.
+// What is worth asking for at a position: never more than the item has
+// left. A 30 s clip primed 21 s in can only ever offer 9, and waiting
+// for twelve means priming that never ends.
+function primeTarget(pos) {
+  var left = (itemDur || PRIME_ENOUGH_S) - pos - 0.2;
+  return Math.max(1, Math.min(PRIME_ENOUGH_S, left));
+}
+
+function startPriming(pos, why) {
+  priming = true; primeFrom = pos; primeMuted = video.muted;
+  video.muted = true;
+  $('overlay').classList.add('solid');
+  primeStartedAt = Date.now();
+  trace(why + ': priming at ' + pos.toFixed(2) + ' for ' + primeTarget(pos).toFixed(1) + 's');
+  if (Math.abs(video.currentTime - pos) > 0.5) video.currentTime = pos;
+  video.play().catch(function (e) {
+    priming = false; video.muted = primeMuted;
+    $('overlay').classList.remove('solid');
+    trace(why + ': priming refused (' + (e && e.name) + ')');
+  });
+}
+
+function stopPriming(why) {
+  // Read what it pulled through before seeking: a seek empties the
+  // reported ranges for a moment, and this number is the whole point.
+  var got = bufferedFrom(primeFrom);
+  priming = false; primedBefore = true;
+  video.pause();
+  video.currentTime = primeFrom;
+  video.muted = primeMuted;
+  $('overlay').classList.remove('solid');
+  if (got >= primeTarget(primeFrom)) primedPos = primeFrom;
+  trace('primed ' + got.toFixed(1) + 's (' + why + '), back to ' + primeFrom.toFixed(2));
+}
 function show(title, sub, join) {
   $('overlay').classList.remove('hidden');
   $('title').textContent = title; $('sub').textContent = sub || '';
