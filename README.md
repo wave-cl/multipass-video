@@ -158,9 +158,14 @@ between (2 seeks, 0 holds, 0 rate changes in 67 s; v0.1.5 had 35 + 30 +
 13 in 210 s). The HUD names what it found and is legible from a sofa on
 a screen 1600 px or wider.
 
-A player with nothing buffered is behind because it is starving, not
-because it is mistimed, so the viewer leaves it alone until it has data
-and then corrects once. Without that guard a Tizen 8 TV cold-starting a
+A player that cannot keep up is behind because it is starving, not
+because it is mistimed, so the viewer leaves it alone until it recovers
+and then corrects once -- unless it has drifted more than three seconds,
+which is worse for everyone watching than one correction. Whether it is
+coping is judged by **whether its clock advances**, not by how much it
+has buffered: a TV that holds only a second but plays it steadily is
+fine, and an earlier version that judged by buffer size left such a set
+six seconds out of step indefinitely. Without that guard a Tizen 8 TV cold-starting a
 4 GB file seeked 27 times in 30 s, each seek discarding the buffer it had
 just filled. That TV will also not fill its buffer at all while paused, so parking on
 the frame gets it nothing. A viewer that finds itself still empty a

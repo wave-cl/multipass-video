@@ -506,6 +506,8 @@ var seeks = 0, holds = 0, lastDrift = 0, smooth = null, backoff = 0;
 // worth doing from a comfortable buffer. One hovering at a second or two
 // is about to starve again, and correcting it is what keeps it starving.
 var starved = false, STARVED_S = 4, STARVE_SWITCH = 2;
+var STARVED_TOLERATE_S = 3;  // ...but being this far out is worse than a correction
+var progWall = 0, progCt = 0, lastProg = null;
 var keyframeMode, lastSeekAt, seekTarget, seekIssuedAt, seekErr, seekLatency, stepping;
 var holding, playIssuedAt, playLatency, holdWorks, resumeTimer = null;
 var stall, settle;   // the clock's stall after a seek or resume, and the pending measurement of it
@@ -520,6 +522,7 @@ var rateWorks, rateValue, rateSetAt, rateProbe, rateFlushes;
 function resetTransient() {
   lastSeekAt = -Infinity; seekTarget = NaN; seekIssuedAt = 0; seekErr = NaN; stepping = 0; smooth = null;
   holding = false; playIssuedAt = 0; settle = null; backoff = 0; starved = false;
+  progWall = 0; progCt = 0; lastProg = null;
   if (resumeTimer) { clearTimeout(resumeTimer); resumeTimer = null; }
   rateValue = 1; rateSetAt = 0; rateProbe = null;
 }
@@ -567,7 +570,9 @@ video.addEventListener('seeked', function () {
     // Behind, and by more than a seek should miss: a keyframe player. Ask
     // for a point further ahead until a landing is ahead of the target.
     keyframeMode = true;
-    if (stepping < MAX_STEPS) { stepping++; seekTo(t.pos); }
+    // Not while the clock is stalled: every landing reads as behind then,
+    // and the hunt would fire its whole budget of seeks in a burst.
+    if (stepping < MAX_STEPS && !starving()) { stepping++; seekTo(t.pos); }
     else stepping = 0;
   } else {
     stepping = 0;
@@ -693,12 +698,36 @@ function checkRateProbe() {
 // fetched and starves it again: a Tizen 8 TV cold-starting a large file
 // made 27 of them in 30 s and never caught up. Let it fill, then correct
 // once. A player that reports no ranges at all is taken at its word.
+// How fast the element's clock is running against the wall clock. This,
+// not the size of the buffer, is what says whether a player is coping: a
+// TV that keeps only a second in hand but plays it steadily at 1.0 is
+// fine, and refusing to correct it leaves it minutes out of step.
+//
+// Measured by accumulating only the continuous stretches. A seek is a
+// jump, not a stretch, and is skipped -- an earlier version cleared the
+// whole measure on every seek, so a stalled player never accumulated
+// enough to be found stalled and was seeked again and again.
+function noteProgress() {
+  var now = Date.now(), ct = video.currentTime;
+  if (lastProg) {
+    var dt = (now - lastProg[0]) / 1000, dct = ct - lastProg[1];
+    if (dt > 0 && dt < 1 && Math.abs(dct) < dt + 0.5) { progWall += dt; progCt += dct; }
+  }
+  lastProg = [now, ct];
+  if (progWall > 3) { progCt *= 3 / progWall; progWall = 3; }   // the last few seconds
+}
+function clockRate() {
+  if (progWall < 1) return 1;   // not enough continuous time to judge
+  return progCt / progWall / (rateValue || 1);
+}
+
 function starving() {
-  if (video.readyState >= 3 && !video.buffered.length) return false;
   if (video.readyState < 3) return true;
+  if (clockRate() > 0.8) return false;        // keeping up, however thin
+  if (!video.buffered.length) return false;   // reports nothing; trust readyState
   var ahead = bufferedAhead();
-  // Buffered to the end of the item is not starving, however little is
-  // left: every item ends that way and none of them needs protecting.
+  // Holding the rest of the item but not playing it is not starvation --
+  // there is nothing left to fetch -- so a correction is allowed to try.
   if (itemDur && video.currentTime + ahead >= itemDur - 0.5) return false;
   return ahead < STARVED_S;
 }
@@ -715,10 +744,14 @@ function correct(pos) {
   lastDrift = raw;
   smooth = smooth === null ? raw : smooth + (raw - smooth) * 0.3;
   var now = Date.now();
+  noteProgress();
   checkRateProbe();
   checkSettle(raw);
 
-  if (starving()) {
+  // A starving player is left alone, because a seek takes away the little
+  // it has -- but only up to a point: being seconds out of step is worse
+  // for everyone watching than one correction.
+  if (starving() && Math.abs(raw) < STARVED_TOLERATE_S) {
     if (!starved) {
       starved = true;
       starvations++;
@@ -872,7 +905,8 @@ function tick() {
         '  seeks ' + seeks + ' holds ' + holds + (isNaN(seekErr) ? '' : ' landed ' + ms(seekErr) + ' off, ' + (seekLatency * 1000).toFixed(0) + 'ms late, stall ' + (stall * 1000).toFixed(0) + 'ms') +
         (keyframeMode ? '  keyframe player' : '') + (holdWorks === false ? '  no holds' : '') +
         (backoff ? '  backoff ' + backoff : '') + (starved ? '  STARVING' : '') +
-        (loadedSrc && loadedSrc !== loadedFile ? '  lighter' : '') + '\n';
+        (loadedSrc && loadedSrc !== loadedFile ? '  lighter' : '') +
+        '  clock ' + clockRate().toFixed(2) + 'x\n';
       break;
   }
   $('unmute').classList.toggle('hidden', !((t.state === 'playing' && video.muted ||
