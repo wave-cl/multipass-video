@@ -764,7 +764,8 @@ function correct(pos) {
     if (!starved) {
       starved = true;
       starvations++;
-      trace('starving: ' + bufferedAhead().toFixed(1) + 's ahead, rs=' + video.readyState +
+      trace('not keeping up: clock ' + clockRate().toFixed(2) + 'x, ' +
+        bufferedAhead().toFixed(1) + 's ahead, rs=' + video.readyState +
         '; not correcting (' + starvations + ')');
       // Twice is a pattern, not a blip: take the lighter rendition from
       // here on. Dropping what is loaded makes the next tick fetch it.
@@ -779,7 +780,8 @@ function correct(pos) {
   }
   if (starved) {
     starved = false;
-    trace('buffer recovered: ' + bufferedAhead().toFixed(1) + 's ahead, drift ' + raw.toFixed(2) + 's');
+    trace('keeping up again: clock ' + clockRate().toFixed(2) + 'x, ' +
+      bufferedAhead().toFixed(1) + 's ahead, drift ' + raw.toFixed(2) + 's');
   }
 
   // A player that can only seek pays a visible stall for every correction,
