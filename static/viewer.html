@@ -288,6 +288,11 @@ function loadItem(it) {
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   if (boundaryTimer) { clearTimeout(boundaryTimer); boundaryTimer = null; }
   resetTransient();
+  // How long a seek takes and how much clock it costs depend on the file
+  // being fetched, not only on the player: measured on one TV, 1.7 s on a
+  // 4 GB film and 1.0 s on a small clip. Carrying the film's figure into
+  // the clip made the next two seeks overshoot.
+  stall = 0; seekLatency = 0;
   video.src = '/media/' + encodeURIComponent(loadedSrc);
   video.loop = !!it.loops;   // a repeating item wraps itself; we only correct
   video.load();
