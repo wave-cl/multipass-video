@@ -475,6 +475,7 @@ var MAX_STEPS = 5;           // forward steps before accepting a landing behind
 var SAMSUNG = /Tizen|SMART-TV|SamsungBrowser/i.test(navigator.userAgent);
 
 var seeks = 0, holds = 0, lastDrift = 0, smooth = null, backoff = 0;
+var starved = false, STARVED_S = 1;
 var keyframeMode, lastSeekAt, seekTarget, seekIssuedAt, seekErr, seekLatency, stepping;
 var holding, playIssuedAt, playLatency, holdWorks, resumeTimer = null;
 var stall, settle;   // the clock's stall after a seek or resume, and the pending measurement of it
@@ -488,7 +489,7 @@ var rateWorks, rateValue, rateSetAt, rateProbe, rateFlushes;
 // and needs a second seek. Only a different file starts from nothing.
 function resetTransient() {
   lastSeekAt = -Infinity; seekTarget = NaN; seekIssuedAt = 0; seekErr = NaN; stepping = 0; smooth = null;
-  holding = false; playIssuedAt = 0; settle = null; backoff = 0;
+  holding = false; playIssuedAt = 0; settle = null; backoff = 0; starved = false;
   if (resumeTimer) { clearTimeout(resumeTimer); resumeTimer = null; }
   rateValue = 1; rateSetAt = 0; rateProbe = null;
 }
@@ -654,6 +655,16 @@ function checkRateProbe() {
   trace('rate probe: asked ' + rateValue + ' measured ' + measured.toFixed(3) + ' -> ' + rateWorks);
 }
 
+// A player with nothing in hand is behind because it is starving, not
+// because it is mistimed, and a seek now throws away what it has just
+// fetched and starves it again: a Tizen 8 TV cold-starting a large file
+// made 27 of them in 30 s and never caught up. Let it fill, then correct
+// once. A player that reports no ranges at all is taken at its word.
+function starving() {
+  if (video.readyState >= 3 && !video.buffered.length) return false;
+  return video.readyState < 3 || bufferedAhead() < STARVED_S;
+}
+
 function correct(pos) {
   if (holding) { checkHold(pos); return; }
   // A seek whose `seeked` never comes (some TV players) would wait forever.
@@ -668,6 +679,19 @@ function correct(pos) {
   var now = Date.now();
   checkRateProbe();
   checkSettle(raw);
+
+  if (starving()) {
+    if (!starved) {
+      starved = true;
+      trace('starving: ' + bufferedAhead().toFixed(1) + 's ahead, rs=' + video.readyState + '; not correcting');
+    }
+    if (rateValue !== 1) setRate(1);
+    return;
+  }
+  if (starved) {
+    starved = false;
+    trace('buffer recovered: ' + bufferedAhead().toFixed(1) + 's ahead, drift ' + raw.toFixed(2) + 's');
+  }
 
   // A player that can only seek pays a visible stall for every correction,
   // so it is allowed a little more slack than one that can nudge silently.
@@ -771,7 +795,8 @@ function tick() {
         (holding ? '  HOLDING ' + ms(wrapDrift(video.currentTime - t.pos)) : '  drift ' + ms(lastDrift) + ' (avg ' + ms(smooth || 0) + ')') +
         '  rate ' + rateValue.toFixed(2) + (rateWorks === null ? ' ?' : rateWorks ? ' ok' : ' ignored') +
         '  seeks ' + seeks + ' holds ' + holds + (isNaN(seekErr) ? '' : ' landed ' + ms(seekErr) + ' off, ' + (seekLatency * 1000).toFixed(0) + 'ms late, stall ' + (stall * 1000).toFixed(0) + 'ms') +
-        (keyframeMode ? '  keyframe player' : '') + (holdWorks === false ? '  no holds' : '') + (backoff ? '  backoff ' + backoff : '') + '\n';
+        (keyframeMode ? '  keyframe player' : '') + (holdWorks === false ? '  no holds' : '') +
+        (backoff ? '  backoff ' + backoff : '') + (starved ? '  STARVING' : '') + '\n';
       break;
   }
   $('unmute').classList.toggle('hidden', !((t.state === 'playing' && video.muted ||

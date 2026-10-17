@@ -138,6 +138,15 @@ between (2 seeks, 0 holds, 0 rate changes in 67 s; v0.1.5 had 35 + 30 +
 13 in 210 s). The HUD names what it found and is legible from a sofa on
 a screen 1600 px or wider.
 
+A player with nothing buffered is behind because it is starving, not
+because it is mistimed, so the viewer leaves it alone until it has data
+and then corrects once. Without that guard a Tizen 8 TV cold-starting a
+4 GB file seeked 27 times in 30 s, each seek discarding the buffer it had
+just filled. The same TV will not fill its buffer at all while paused, so
+the countdown only hands it a full buffer for content it was already
+streaming -- a resume after an intermission (measured: 20.6 s buffered).
+A file it has not played yet still starts cold there.
+
 To see what any player is doing, open the viewer with `?trace` (TV
 browsers trace without being asked): it reports every seek, landing,
 hold, rate verdict and element event to the server's log, readable with
