@@ -23,6 +23,7 @@
   #queue li span.name{font-variant-numeric:tabular-nums}
   #queue li button{font-size:13px;padding:2px 8px;margin:0 0 0 6px;background:#333;color:#eee}
   #total{margin-bottom:10px}
+  .warn{color:#f66;opacity:1}
 </style>
 </head>
 <body>
@@ -50,6 +51,7 @@
     <div id="total"><small>Nothing queued.</small></div>
     <label><input type="radio" name="when" value="now" checked> Start now</label>
     <label><input type="radio" name="when" value="at"> Start at <input type="datetime-local" id="at" step="1"></label>
+    <label><input type="radio" name="when" value="keep" id="keep"> Keep the current start time <small id="keephint"></small></label>
     <label><input type="checkbox" id="loop"> Loop the whole playlist</label>
     <label>Then loop <select id="then"><option value="">— nothing, stop at the end —</option></select></label>
     <button type="submit">Start</button>
@@ -133,6 +135,7 @@ function renderQueue() {
   $('total').innerHTML = queue.length
     ? `<small>${queue.length} item(s), ${fmt(total)} in all</small>`
     : '<small>Nothing queued.</small>';
+  updateKeep();
 }
 
 function move(i, by) {
@@ -155,8 +158,36 @@ $('add').onclick = () => {
 
 // A list that repeats never reaches what follows it; the server refuses
 // the pair, so do not offer it.
-function syncLoop() { $('then').disabled = $('loop').checked; }
+function syncLoop() { $('then').disabled = $('loop').checked; updateKeep(); }
 $('loop').onchange = syncLoop;
+
+// "Keep the current start time" is for adding to what is already on air --
+// a `then`, another item -- without restarting it. Against a *different*
+// queue the kept time still counts from then, so the list starts part-way
+// through or has already played out; say which, rather than let it
+// surprise you after you press Start.
+function updateKeep() {
+  const keep = $('keep'), hint = $('keephint');
+  const s = state && state.schedule;
+  keep.disabled = !s;
+  if (!s) {
+    if (keep.checked) document.querySelector('input[name=when][value=now]').checked = true;
+    hint.textContent = '(nothing is on air)';
+    hint.className = '';
+    return;
+  }
+  const when = new Date(s.start_ms).toLocaleTimeString();
+  const elapsed = (Date.now() + offset - s.start_ms) / 1000;
+  const total = queue.reduce((a, q) => a + q.duration_ms, 0) / 1000;
+  let warn = false, where;
+  if (elapsed < 0) where = `${when}, in ${fmt(-elapsed)}`;
+  else if (!(total > 0)) where = when;
+  else if (elapsed < total) where = `${when} — the queue would be ${fmt(elapsed)} in`;
+  else if ($('loop').checked) where = `${when} — the queue would be ${fmt(elapsed % total)} into a later pass`;
+  else { where = `${when} — the queue would already have played out`; warn = true; }
+  hint.textContent = `(${where})`;
+  hint.className = warn ? 'warn' : '';
+}
 tokenEl.addEventListener('change', loadFiles);
 if (tokenEl.value) loadFiles();
 
@@ -169,10 +200,14 @@ $('form').addEventListener('submit', async e => {
     then: $('loop').checked ? null : ($('then').value || null),
     start_ms: null,
   };
-  if (document.querySelector('input[name=when]:checked').value === 'at') {
+  const when = document.querySelector('input[name=when]:checked').value;
+  if (when === 'at') {
     const t = new Date($('at').value).getTime();
     if (isNaN(t)) { say('Pick a start time', true); return; }
     body.start_ms = t;
+  } else if (when === 'keep') {
+    if (!state || !state.schedule) { say('Nothing is on air to keep the start time of', true); return; }
+    body.start_ms = state.schedule.start_ms;
   }
   const r = await fetch('/api/schedule', {method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   say(r.ok ? `Scheduled ${queue.length} item(s)` : `Refused: ${r.status} ${await r.text()}`, !r.ok);
@@ -196,6 +231,7 @@ es.addEventListener('state', e => { state = JSON.parse(e.data); offset = state.s
 es.onerror = () => { $('status').textContent = 'Disconnected — reconnecting…'; };
 
 function render() {
+  updateKeep();   // first: the early returns below are where it matters most
   if (!state) return;
   const s = state.schedule, im = state.intermission_since_ms;
   $('intermission').textContent = im ? `End intermission (${fmt((Date.now() + offset - im) / 1000)})` : 'Intermission';
