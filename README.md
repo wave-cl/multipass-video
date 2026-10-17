@@ -55,6 +55,20 @@ Item boundaries are switched on a timer aimed at the exact moment, not
 on the next quarter-second tick, so the next item starts about 30 ms
 after it is due plus whatever the browser takes to open the file.
 
+## Codes
+
+`/code` is a second way to watch, outside the schedule: type a file's
+five-digit code on the keypad and that file plays from the beginning,
+for that viewer alone. When it ends the keypad comes back for the next
+one. The picture and its controls are the stream's -- full screen, tap
+anywhere on it for fullscreen -- and the keypad is plain buttons, so a
+TV remote's arrows and OK work without the page knowing about remotes.
+
+Codes are derived from the file's name rather than stored, so they
+survive restarts and need no bookkeeping; renaming a file changes its
+code. The admin page lists them. Two names can land on the same number,
+in which case the one that sorts later takes the next free code.
+
 ## Intermission
 
 The admin page's **Intermission** button pauses the film for everyone: the
@@ -222,13 +236,14 @@ ffmpeg -f lavfi -i testsrc=size=640x360:rate=30 -f lavfi -i sine=frequency=440:s
 | POST | `/api/intermission` | admin | pause the film for everyone, play music |
 | DELETE | `/api/intermission` | admin | resume where it was paused |
 | GET | `/intermission-audio` | – | the music, with range support |
+| GET | `/api/code/<code>` | – | `{file}` for a five-digit code, 404 otherwise |
 | GET | `/media/<file>` | – | the file, with range support |
 
 `schedule` is `{items: [{file, duration_ms}], start_ms, loop, then}` or
 `null`, where `then` is an item or `null`; `intermission_since_ms` is set
 while an intermission is on, and `resume_at_ms` is the moment the film
-starts again after one. `/api/files` gives each file's `duration_ms`,
-or `null` when it could not be read. Admin calls send
+starts again after one. `/api/files` gives each file's `duration_ms` (or `null` when it could not
+be read) and its `code`. Admin calls send
 `Authorization: Bearer <token>`.
 
 ## Not done (yet)

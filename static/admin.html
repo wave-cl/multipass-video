@@ -23,6 +23,9 @@
   #queue li span.name{font-variant-numeric:tabular-nums}
   #queue li button{font-size:13px;padding:2px 8px;margin:0 0 0 6px;background:#333;color:#eee}
   #total{margin-bottom:10px}
+  #codes{margin-bottom:10px}
+  #codes div{padding:2px 0;font-variant-numeric:tabular-nums}
+  #codes b{font:600 16px ui-monospace,Menlo,monospace;margin-right:10px;letter-spacing:.08em}
   .warn{color:#f66;opacity:1}
 </style>
 </head>
@@ -40,6 +43,14 @@
   <div id="status">Connecting…</div>
   <div style="margin-top:12px"><button id="intermission">Intermission</button><button id="stop" class="quiet">Stop</button> <a href="/" target="_blank" style="color:#9cf">open viewer ↗</a></div>
   <small>Intermission pauses the film for everyone and plays music. Ending it starts a 10 second countdown, which every viewer spends buffering the exact frame it resumes at — 10 seconds before where it left off — so they all start together. Starting any content works the same way.</small>
+</section>
+
+<section>
+  <h2>Codes</h2>
+  <div id="codes"><small>Enter a token to see the codes.</small></div>
+  <small>Typed at <a href="/code" target="_blank" style="color:#9cf">/code</a>, a code plays that file
+    on its own, outside the schedule. Codes come from the file name, so they survive restarts and
+    change only if you rename the file.</small>
 </section>
 
 <section>
@@ -95,6 +106,13 @@ async function loadFiles() {
       o.disabled = !f.duration_ms;   // no length, no place in a playlist
       target.appendChild(o);
     }
+  }
+  const codes = $('codes');
+  codes.innerHTML = files.length ? '' : '<small>No playable files.</small>';
+  for (const f of files) {
+    const row = document.createElement('div');
+    row.innerHTML = `<b>${f.code}</b>${f.name}`;
+    codes.appendChild(row);
   }
   say(`${files.length} file(s)`);
   prefill();

@@ -42,6 +42,7 @@ use tracing::{info, warn};
 const VIEWER_HTML: &str = include_str!("../static/viewer.html");
 const ADMIN_HTML: &str = include_str!("../static/admin.html");
 const LOGIN_HTML: &str = include_str!("../static/login.html");
+const CODE_HTML: &str = include_str!("../static/code.html");
 /// The intermission music when the media dir has no `intermission.*`.
 const INTERMISSION_AUDIO: &[u8] = include_bytes!("../static/intermission.m4a");
 const VIEWER_COOKIE: &str = "mp_viewer";
@@ -159,6 +160,8 @@ struct StateView {
 #[derive(Serialize)]
 struct FileEntry {
     name: String,
+    /// What to type at /code to play this one.
+    code: u32,
     size: u64,
     /// None when neither the MP4 header nor ffprobe could say; such a file
     /// cannot be put in a playlist, because its boundary is unknown.
@@ -341,6 +344,39 @@ fn probe_duration_ms(path: &Path) -> Option<i64> {
         Err(e) => warn!("{}: {e}", path.display()),
     }
     ffprobe_duration_ms(path)
+}
+
+/// The five-digit code that plays a file at /code. Derived from the name
+/// rather than stored: it survives restarts and needs no bookkeeping, and
+/// the only way to change one is to rename the file.
+fn code_for(name: &str) -> u32 {
+    let d = Sha256::digest(name.as_bytes());
+    let n = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+    10_000 + n % 90_000
+}
+
+/// Every playable file's code. Two names can land on the same number, so
+/// the one that sorts later walks up to the next free code -- which keeps
+/// the assignment stable as long as the directory's names are.
+fn codes(media_dir: &Path) -> std::collections::BTreeMap<u32, String> {
+    let mut names: Vec<String> = match std::fs::read_dir(media_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| valid_file_name(n) && playable(n))
+            .collect(),
+        Err(_) => return Default::default(),
+    };
+    names.sort();
+    let mut out = std::collections::BTreeMap::new();
+    for name in names {
+        let mut code = code_for(&name);
+        while out.contains_key(&code) {
+            code = 10_000 + (code - 10_000 + 1) % 90_000;
+        }
+        out.insert(code, name);
+    }
+    out
 }
 
 /// The lighter rendition beside a file, if there is one and it runs as
@@ -616,6 +652,34 @@ async fn admin() -> Html<&'static str> {
     Html(ADMIN_HTML)
 }
 
+async fn code_page() -> Html<&'static str> {
+    Html(CODE_HTML)
+}
+
+/// What a code plays. Public, like the stream itself: a code is how a
+/// viewer asks for a file, and a wrong one waits a moment before saying
+/// so, which makes working through all ninety thousand tedious.
+async fn get_code(
+    State(app): State<App>,
+    axum::extract::Path(code): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let code: u32 = code.parse().map_err(|_| StatusCode::NOT_FOUND)?;
+    let media_dir = app.media_dir.clone();
+    let found = tokio::task::spawn_blocking(move || codes(&media_dir).get(&code).cloned())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match found {
+        Some(file) => {
+            info!("code {code} played {file}");
+            Ok(Json(serde_json::json!({ "file": file })))
+        }
+        None => {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+}
+
 async fn get_state(State(app): State<App>) -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Json(app.view()))
 }
@@ -657,6 +721,7 @@ async fn list_files(
             continue;
         }
         out.push(FileEntry {
+            code: 0, // filled in below, where collisions can be seen
             name,
             size: meta.len(),
             duration_ms: None,
@@ -666,8 +731,14 @@ async fn list_files(
     // Probing reads headers and may run ffprobe, so it goes off the runtime.
     let media_dir = app.media_dir.clone();
     let out = tokio::task::spawn_blocking(move || {
+        let by_code = codes(&media_dir);
         for e in &mut out {
             e.duration_ms = probe_duration_ms(&media_dir.join(&e.name));
+            e.code = by_code
+                .iter()
+                .find(|(_, n)| **n == e.name)
+                .map(|(c, _)| *c)
+                .unwrap_or(0);
         }
         out
     })
@@ -853,6 +924,8 @@ fn router(app: App) -> Router {
     Router::new()
         .route("/", get(viewer))
         .route("/login", get(login_page).post(login_post))
+        .route("/code", get(code_page))
+        .route("/api/code/{code}", get(get_code))
         .route("/admin", get(admin))
         .route("/api/state", get(get_state))
         .route("/api/events", get(events))
@@ -956,6 +1029,62 @@ mod tests {
         }
         for bad in ["a.mkv", "a.txt", "mp4", "a"] {
             assert!(!playable(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn codes_are_five_digits_stable_and_distinct() {
+        // Five digits, never with a leading zero, and the same every time.
+        for name in ["a.mp4", "out.mp4", "My Film (2024).webm"] {
+            let c = code_for(name);
+            assert!((10_000..=99_999).contains(&c), "{name} -> {c}");
+            assert_eq!(c, code_for(name));
+        }
+        assert_ne!(code_for("a.mp4"), code_for("b.mp4"));
+
+        let dir = test_dir("codes");
+        for name in ["a.mp4", "b.mp4", "c.mp4"] {
+            std::fs::write(dir.join(name), fake_mp4(1000)).unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), b"not a video").unwrap();
+        let map = codes(&dir);
+        assert_eq!(map.len(), 3, "only playable files get a code");
+        let mut files: Vec<&String> = map.values().collect();
+        files.sort();
+        assert_eq!(files, vec!["a.mp4", "b.mp4", "c.mp4"]);
+        for (code, name) in &map {
+            assert_eq!(*code, code_for(name), "no collisions here, so no walking");
+        }
+        // Stable across calls, and unaffected by an unplayable neighbour.
+        assert_eq!(map, codes(&dir));
+    }
+
+    #[tokio::test]
+    async fn a_code_plays_a_file_and_a_wrong_one_does_not() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let dir = test_dir("codelookup");
+        let app = test_app_in(&dir, None);
+        std::fs::write(dir.join("film.mp4"), fake_mp4(1000)).unwrap();
+        let code = code_for("film.mp4");
+
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/api/code/{code}")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["file"], "film.mp4");
+
+        for bad in ["00000", "99999", "abcde", "1", "../x"] {
+            let res = app
+                .clone()
+                .oneshot(get(&format!("/api/code/{bad}")))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{bad}");
         }
     }
 
