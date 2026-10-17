@@ -11,6 +11,8 @@
   #video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;background:#000}
   #overlay{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.65);text-align:center;padding:16px}
   #overlay h1{font-size:28px;font-weight:600;margin:0 0 14px}
+  /* While a player is being primed it is running behind this: hide it. */
+  #overlay.solid{background:#000}
   /* Intermission card: an 80s public-access "please stand by" -- colour
      bars, scanlines, chroma-fringed chunky type, a CRT vignette. All CSS.
      It is always in the page, painted at opacity 0 on its own compositor
@@ -96,7 +98,17 @@ var itemLoops = false;    // whether this item is the one that repeats
 var boundaryTimer = null; // fires tick() exactly when this item runs out
 var prerollAt = null;     // the start moment we are parked and buffering for
 var prerollTimer = null;
+var parkedAt = 0;
 var PREROLL_S = 10;       // park and fill the buffer this long before a start
+// Some players -- Samsung's TV browser -- will not fill their buffer at
+// all while paused, so parking on the frame gets them nothing and they
+// start cold. Those are run muted behind the card instead, to pull the
+// data through, and sent back to the frame before the countdown ends.
+var priming = false, primeFrom = NaN, primeMuted = false;
+var PRIME_UNDER_S = 2;    // buffered this little after parking: it is not filling
+var PRIME_NEEDS_S = 4;    // only worth starting with this long to go
+var PRIME_STOP_S = 1.5;   // back to the frame this long before the start
+var PRIME_ENOUGH_S = 12;  // or as soon as this much is in hand
 var loadError = false;
 
 // --- clock ----------------------------------------------------------------
@@ -730,6 +742,8 @@ function tick() {
   if (t.state !== 'preroll' && prerollAt !== null) {
     prerollAt = null;
     if (prerollTimer) { clearTimeout(prerollTimer); prerollTimer = null; }
+    if (priming) { priming = false; video.muted = primeMuted; }
+    $('overlay').classList.remove('solid');
   }
   switch (t.state) {
     case 'idle':    pause(); show('Nothing scheduled', ''); break;
@@ -737,11 +751,36 @@ function tick() {
     case 'preroll':
       // Hold still on the frame it starts from -- the buffer fills there
       // while we wait -- and begin when the clock says, not a tick later.
-      if (!video.paused) video.pause();
+      if (!priming && !video.paused) video.pause();
       if (prerollAt !== t.at && video.readyState >= 1) {
         prerollAt = t.at;
+        parkedAt = Date.now();
         video.currentTime = t.pos;
         trace('preroll: parked at ' + t.pos.toFixed(2) + ', ' + t.in.toFixed(1) + 's to go');
+      }
+      // Nothing came in while parked: pull it through by playing muted,
+      // out of sight, and go back to the frame before the start.
+      if (!priming && prerollAt === t.at && video.readyState >= 1 &&
+          Date.now() - parkedAt > 1500 && t.in > PRIME_NEEDS_S && bufferedAhead() < PRIME_UNDER_S) {
+        priming = true; primeFrom = t.pos; primeMuted = video.muted;
+        video.muted = true;
+        $('overlay').classList.add('solid');
+        trace('preroll: priming -- nothing buffered while parked');
+        video.play().catch(function (e) {
+          priming = false; video.muted = primeMuted;
+          trace('preroll: priming refused (' + (e && e.name) + ')');
+        });
+      }
+      if (priming && (t.in <= PRIME_STOP_S || bufferedFrom(primeFrom) >= PRIME_ENOUGH_S)) {
+        // Read what it pulled through before seeking: a seek empties the
+        // reported ranges for a moment, and this number is the whole point.
+        var got = bufferedFrom(primeFrom), why = t.in <= PRIME_STOP_S ? 'out of time' : 'enough';
+        priming = false;
+        video.pause();
+        video.currentTime = primeFrom;
+        video.muted = primeMuted;
+        $('overlay').classList.remove('solid');
+        trace('preroll: primed ' + got.toFixed(1) + 's (' + why + '), back to ' + primeFrom.toFixed(2));
       }
       if (prerollAt === t.at && !prerollTimer && t.in * 1000 - playLatency * 1000 <= 400) {
         prerollTimer = setTimeout(function () {
@@ -760,8 +799,9 @@ function tick() {
       } else {
         show('Starting in ' + countdown(t.in), '');
       }
-      hud = 'starting in ' + t.in.toFixed(1) + 's at ' + fmt(t.pos) +
-        ', ' + bufferedAhead().toFixed(1) + 's buffered\n';
+      hud = 'starting in ' + t.in.toFixed(1) + 's at ' + fmt(t.pos) + ', ' +
+        (priming ? bufferedFrom(primeFrom).toFixed(1) + 's buffered (priming)'
+                 : bufferedAhead().toFixed(1) + 's buffered') + '\n';
       break;
     case 'loading': pause(); show('Loading…', ''); break;
     case 'error':
@@ -808,14 +848,15 @@ function tick() {
 function pause() { if (!video.paused) video.pause(); }
 // Seconds, as a number while it is short enough to read as one.
 function countdown(s) { return s < 60 ? String(Math.max(0, Math.ceil(s))) : fmt(s); }
-// How much is buffered from where the element is sitting.
-function bufferedAhead() {
-  var ct = video.currentTime;
+// How much is buffered forward from a point, and from where the element
+// is sitting.
+function bufferedFrom(t) {
   for (var i = 0; i < video.buffered.length; i++) {
-    if (video.buffered.start(i) <= ct + 0.1 && video.buffered.end(i) >= ct) return video.buffered.end(i) - ct;
+    if (video.buffered.start(i) <= t + 0.1 && video.buffered.end(i) >= t) return video.buffered.end(i) - t;
   }
   return 0;
 }
+function bufferedAhead() { return bufferedFrom(video.currentTime); }
 function show(title, sub, join) {
   $('overlay').classList.remove('hidden');
   $('title').textContent = title; $('sub').textContent = sub || '';

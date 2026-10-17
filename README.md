@@ -142,10 +142,14 @@ A player with nothing buffered is behind because it is starving, not
 because it is mistimed, so the viewer leaves it alone until it has data
 and then corrects once. Without that guard a Tizen 8 TV cold-starting a
 4 GB file seeked 27 times in 30 s, each seek discarding the buffer it had
-just filled. The same TV will not fill its buffer at all while paused, so
-the countdown only hands it a full buffer for content it was already
-streaming -- a resume after an intermission (measured: 20.6 s buffered).
-A file it has not played yet still starts cold there.
+just filled. That TV will also not fill its buffer at all while paused, so parking on
+the frame gets it nothing. A viewer that finds itself still empty a
+second and a half after parking **primes**: it plays the item muted
+behind a blacked-out overlay to pull the data through, then pauses back
+onto the exact frame before the countdown ends -- a backward seek into
+what it just buffered, which is cheap even there. The trigger is
+behaviour, not a user agent, so a player that does fill while paused
+never primes.
 
 To see what any player is doing, open the viewer with `?trace` (TV
 browsers trace without being asked): it reports every seek, landing,
