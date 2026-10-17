@@ -106,7 +106,7 @@ var PREROLL_S = 10;       // park and fill the buffer this long before a start
 // data through, and sent back to the frame before the countdown ends.
 var priming = false, primeFrom = NaN, primeMuted = false;
 var PRIME_UNDER_S = 2;    // buffered this little after parking: it is not filling
-var PRIME_NEEDS_S = 4;    // only worth starting with this long to go
+var PRIME_NEEDS_S = 2.5;  // only worth starting with this long to go
 var PRIME_STOP_S = 1.5;   // back to the frame this long before the start
 var PRIME_ENOUGH_S = 12;  // or as soon as this much is in hand
 var loadError = false;
@@ -487,7 +487,10 @@ var MAX_STEPS = 5;           // forward steps before accepting a landing behind
 var SAMSUNG = /Tizen|SMART-TV|SamsungBrowser/i.test(navigator.userAgent);
 
 var seeks = 0, holds = 0, lastDrift = 0, smooth = null, backoff = 0;
-var starved = false, STARVED_S = 1;
+// A seek costs this player a buffer and ~1.7 s of stall, so it is only
+// worth doing from a comfortable buffer. One hovering at a second or two
+// is about to starve again, and correcting it is what keeps it starving.
+var starved = false, STARVED_S = 4;
 var keyframeMode, lastSeekAt, seekTarget, seekIssuedAt, seekErr, seekLatency, stepping;
 var holding, playIssuedAt, playLatency, holdWorks, resumeTimer = null;
 var stall, settle;   // the clock's stall after a seek or resume, and the pending measurement of it
@@ -582,7 +585,10 @@ function checkSettle(raw) {
   // Settled within tolerance: the next seek, whenever it comes, need not
   // wait longer than usual. Not: wait longer each time, so a player whose
   // stall varies from seek to seek converges on seeking rarely.
-  if (Math.abs(raw) < SEEK_ABOVE) backoff = 0;
+  // Only a settle on a healthy buffer earns a fresh start: a player that
+  // settles and immediately thins out is not fixed, and resetting the
+  // backoff lets it be seeked again every few seconds.
+  if (Math.abs(raw) < SEEK_ABOVE && !starving()) backoff = 0;
   trace('settled: lost ' + lost.toFixed(3) + ' -> stall ' + stall.toFixed(3) + ' drift now ' + raw.toFixed(3) + ' backoff ' + backoff);
 }
 
@@ -674,7 +680,12 @@ function checkRateProbe() {
 // once. A player that reports no ranges at all is taken at its word.
 function starving() {
   if (video.readyState >= 3 && !video.buffered.length) return false;
-  return video.readyState < 3 || bufferedAhead() < STARVED_S;
+  if (video.readyState < 3) return true;
+  var ahead = bufferedAhead();
+  // Buffered to the end of the item is not starving, however little is
+  // left: every item ends that way and none of them needs protecting.
+  if (itemDur && video.currentTime + ahead >= itemDur - 0.5) return false;
+  return ahead < STARVED_S;
 }
 
 function correct(pos) {
