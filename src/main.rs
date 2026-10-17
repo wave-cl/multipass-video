@@ -128,6 +128,11 @@ struct Persisted {
     /// its length: ending it moves the schedule's start forward by that.
     #[serde(default)]
     intermission_since_ms: Option<i64>,
+    /// When the film starts again after an intermission -- a moment in the
+    /// near future, which every viewer spends parked on the exact timestamp
+    /// it will resume at, filling its buffer there.
+    #[serde(default)]
+    resume_at_ms: Option<i64>,
 }
 
 /// What clients see: the state plus the server clock for offset estimation.
@@ -137,6 +142,7 @@ struct StateView {
     version: u64,
     schedule: Option<Schedule>,
     intermission_since_ms: Option<i64>,
+    resume_at_ms: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -166,7 +172,7 @@ struct ScheduleRequest {
     /// A single file, as the API took before 0.4: a playlist of one.
     #[serde(default)]
     file: Option<String>,
-    /// Absent or null means "now".
+    /// Absent or null means "when the countdown runs out".
     start_ms: Option<i64>,
     /// Repeat the whole list forever.
     #[serde(rename = "loop", default)]
@@ -368,6 +374,7 @@ impl Inner {
             version: s.version,
             schedule: s.schedule.clone(),
             intermission_since_ms: s.intermission_since_ms,
+            resume_at_ms: s.resume_at_ms,
         }
     }
 
@@ -389,6 +396,7 @@ impl Inner {
         self.update(|s| {
             s.schedule = schedule;
             s.intermission_since_ms = None;
+            s.resume_at_ms = None;
         })
     }
 
@@ -656,7 +664,9 @@ async fn set_schedule(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     let schedule = Schedule {
         items,
-        start_ms: req.start_ms.unwrap_or_else(now_ms),
+        // "Now" is the end of the countdown: viewers need a moment to
+        // park on the first frame and buffer it before anyone plays.
+        start_ms: req.start_ms.unwrap_or_else(|| now_ms() + COUNTDOWN_MS),
         loop_: req.loop_,
         then,
         file: None,
@@ -696,6 +706,7 @@ async fn start_intermission(
         if s.intermission_since_ms.is_none() {
             s.intermission_since_ms = Some(now);
         }
+        s.resume_at_ms = None; // cancels a countdown that was running
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     info!("intermission started");
@@ -704,10 +715,16 @@ async fn start_intermission(
 
 /// End the intermission. A film that had started resumes a little before
 /// where it was paused -- `REWIND_MS` back, so the audience picks the thread
-/// up -- its start moving forward by the intermission's length plus that.
+/// up -- and not at once but `COUNTDOWN_MS` from now. Every viewer spends
+/// that countdown parked on the one timestamp it will resume at, filling
+/// its buffer, so they start together instead of each stuttering in.
 /// Never before the film's own beginning. One that had not started yet
 /// keeps its countdown.
 const REWIND_MS: i64 = 10_000;
+
+/// The lead every start gets: an intermission ending, and anything
+/// scheduled for "now".
+const COUNTDOWN_MS: i64 = 10_000;
 async fn end_intermission(
     State(app): State<App>,
     headers: HeaderMap,
@@ -716,10 +733,16 @@ async fn end_intermission(
         .map_err(|s| (s, "admin token required".into()))?;
     let now = now_ms();
     app.update(|s| {
+        s.resume_at_ms = None;
         if let Some(since) = s.intermission_since_ms.take() {
             if let Some(sch) = &mut s.schedule {
                 if sch.start_ms <= since {
-                    sch.start_ms = (sch.start_ms + (now - since) + REWIND_MS).min(now);
+                    // It was this far in when it paused; when the countdown
+                    // runs out it should be there again, less the rewind.
+                    let paused_at = since - sch.start_ms;
+                    let resume_at = now + COUNTDOWN_MS;
+                    sch.start_ms = (resume_at - paused_at + REWIND_MS).min(resume_at);
+                    s.resume_at_ms = Some(resume_at);
                 }
             }
         }
@@ -1139,6 +1162,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn starting_now_means_after_the_countdown() {
+        use http_body_util::BodyExt;
+        let dir = test_dir("countdown");
+        let app = test_app_in(&dir, None);
+        std::fs::write(dir.join("a.mp4"), fake_mp4(20_000)).unwrap();
+        let post = |body: &str| {
+            Request::post("/api/schedule")
+                .header(header::AUTHORIZATION, "Bearer admin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.to_string().into())
+                .unwrap()
+        };
+        let start_of = |app: &Router| {
+            let app = app.clone();
+            async move {
+                use tower::ServiceExt;
+                let res = app.oneshot(get("/api/state")).await.unwrap();
+                let body = res.into_body().collect().await.unwrap().to_bytes();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["schedule"]["start_ms"]
+                    .as_i64()
+                    .unwrap()
+            }
+        };
+
+        assert_eq!(
+            call(&app, post(r#"{"files":["a.mp4"]}"#)).await.0,
+            StatusCode::OK
+        );
+        let ahead = start_of(&app).await - now_ms();
+        assert!(
+            (9_000..=10_000).contains(&ahead),
+            "a start with no time given is {ahead} ms away, wanted the countdown"
+        );
+
+        // An explicit time is obeyed, including one in the past: that is
+        // how the admin page keeps a running film where it is.
+        let past = now_ms() - 60_000;
+        let body = format!(r#"{{"files":["a.mp4"],"start_ms":{past}}}"#);
+        assert_eq!(call(&app, post(&body)).await.0, StatusCode::OK);
+        assert_eq!(start_of(&app).await, past);
+    }
+
+    #[tokio::test]
     async fn a_schedule_written_before_playlists_still_plays() {
         let dir = test_dir("legacy");
         std::fs::write(dir.join("old.mp4"), fake_mp4(123_000)).unwrap();
@@ -1208,11 +1274,27 @@ mod tests {
         assert_eq!(call(&app, req).await.0, StatusCode::OK);
         let s = state(&app).await;
         assert!(s["intermission_since_ms"].is_null());
-        // Moved forward by the intermission's length (50 ms+) plus the 10 s rewind.
+        // Moved forward by the intermission's length (50 ms+), the 10 s
+        // rewind, and the 10 s countdown before anyone plays again.
         let shifted = s["schedule"]["start_ms"].as_i64().unwrap() - started;
         assert!(
-            (10_050..12_000).contains(&shifted),
+            (20_050..22_000).contains(&shifted),
             "start moved by {shifted} ms"
+        );
+        // The countdown is published, and lands where the film was paused
+        // less the rewind -- which is what every viewer parks on.
+        let resume_at = s["resume_at_ms"].as_i64().expect("a resume moment");
+        let ahead = resume_at - now_ms();
+        assert!(
+            (9_000..=10_000).contains(&ahead),
+            "resume is {ahead} ms away"
+        );
+        let at_resume = resume_at - s["schedule"]["start_ms"].as_i64().unwrap();
+        let paused_at = 100_000; // it had been playing that long
+        assert!(
+            ((paused_at - REWIND_MS - 500)..(paused_at - REWIND_MS + 500)).contains(&at_resume),
+            "resumes {at_resume} ms in, wanted about {}",
+            paused_at - REWIND_MS
         );
 
         // A film paused 2 s in cannot rewind 10 s: it resumes from its start.
@@ -1233,9 +1315,10 @@ mod tests {
         call(&app, req).await;
         let s = state(&app).await;
         let start = s["schedule"]["start_ms"].as_i64().unwrap();
-        assert!(
-            start <= now_ms() && start > now_ms() - 500,
-            "resumes from the beginning, not before it"
+        let resume_at = s["resume_at_ms"].as_i64().expect("a resume moment");
+        assert_eq!(
+            start, resume_at,
+            "resumes from its own beginning when the countdown ends, never before it"
         );
 
         // A film that has not started keeps its countdown.
@@ -1257,6 +1340,10 @@ mod tests {
         call(&app, req).await;
         let s = state(&app).await;
         assert_eq!(s["schedule"]["start_ms"].as_i64().unwrap(), future);
+        assert!(
+            s["resume_at_ms"].is_null(),
+            "nothing was paused, nothing resumes"
+        );
 
         // Without the token: refused.
         let req = Request::post("/api/intermission")

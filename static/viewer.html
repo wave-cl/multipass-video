@@ -59,7 +59,7 @@
 <div id="intermission">
   <div class="bars"></div>
   <div class="noise"></div>
-  <div class="band"><h1>We'll be right back</h1></div>
+  <div class="band"><h1 id="iline">We'll be right back</h1></div>
   <div class="roll"></div>
   <div class="scan"></div>
   <div class="vig"></div>
@@ -87,12 +87,16 @@ if (TRACE_EARLY) music.addEventListener('canplaythrough', function () { trace('m
 // --- what the server says -------------------------------------------------
 var schedule = null;      // {items, start_ms, loop, then} or null
 var intermission = null;  // when it began (server ms), or null
+var resumeAt = null;      // when the film starts again after one, or null
 var version = -1;
 var loadedFile = null;    // what the video element holds
 var duration = NaN;       // of the loaded file, seconds, from the element
 var itemDur = NaN;        // ...and what the server says, which sets the boundary
 var itemLoops = false;    // whether this item is the one that repeats
 var boundaryTimer = null; // fires tick() exactly when this item runs out
+var prerollAt = null;     // the start moment we are parked and buffering for
+var prerollTimer = null;
+var PREROLL_S = 10;       // park and fill the buffer this long before a start
 var loadError = false;
 
 // --- clock ----------------------------------------------------------------
@@ -178,6 +182,7 @@ function apply(s) {
   playTries = 0; musicTries = 0;
   schedule = s.schedule;
   intermission = s.intermission_since_ms;
+  resumeAt = s.resume_at_ms;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   // Which file to hold is the clock's business, decided in tick(): a
   // playlist's item changes with time, not only with the schedule. The
@@ -199,10 +204,13 @@ function apply(s) {
     var onPlaying = function () { music.removeEventListener('playing', onPlaying); trace('music playing ' + (Date.now() - tm) + 'ms after the event'); };
     music.addEventListener('playing', onPlaying);
   } else if (!intermission && was) {
-    trace('intermission over: resuming');
+    trace('intermission over: resuming' + (resumeAt ? ' in ' + ((resumeAt - serverNow()) / 1000).toFixed(1) + 's' : ' now'));
     var t1 = Date.now();
     requestAnimationFrame(function () { requestAnimationFrame(function () { trace('card gone ' + (Date.now() - t1) + 'ms after the event'); }); });
-    fadeOutMusic();
+    // With a countdown the music plays on under it and the preroll fades
+    // it so it lands silent as the picture starts; only an immediate
+    // resume fades here.
+    if (!(resumeAt && resumeAt > serverNow())) fadeOutMusic();
   }
   tick();   // now, not at the next tick
 }
@@ -404,8 +412,23 @@ function itemAt(t) {
 function target() {
   if (intermission) return {state: 'intermission'};
   if (!schedule) return {state: 'idle'};
-  var t = (serverNow() - schedule.start_ms) / 1000;
-  if (t < 0) return {state: 'waiting', in: -t};
+  var now = serverNow();
+  // The next moment the picture starts: a start still ahead, or the end of
+  // the countdown after an intermission. Inside the last few seconds every
+  // viewer parks on the frame it will start from and fills its buffer
+  // there, so they all begin together instead of each stuttering in.
+  var at = schedule.start_ms > now ? schedule.start_ms
+         : (resumeAt && resumeAt > now ? resumeAt : 0);
+  if (at) {
+    var left = (at - now) / 1000;
+    var first = itemAt((at - schedule.start_ms) / 1000);
+    if (first && left <= PREROLL_S) {
+      return {state: 'preroll', item: first, pos: first.pos, in: left, at: at,
+              card: !!(resumeAt && resumeAt > now)};
+    }
+    return {state: 'waiting', in: left};
+  }
+  var t = (now - schedule.start_ms) / 1000;
   var it = itemAt(t);
   if (!it) return {state: 'ended'};
   if (it.file !== loadedFile) return {state: 'loading', item: it};
@@ -675,13 +698,47 @@ function tick() {
   var t = target();
   var hud = '';
   if (t.item && t.item.file !== loadedFile) loadItem(t.item);
-  if (t.state !== 'intermission') {
+  var showCard = t.state === 'intermission' || (t.state === 'preroll' && t.card);
+  if (!showCard) {
     if ($('intermission').classList.contains('on')) $('intermission').classList.remove('on');
     if (!music.paused && !fadeTimer) music.pause();
   }
+  if (t.state !== 'preroll' && prerollAt !== null) {
+    prerollAt = null;
+    if (prerollTimer) { clearTimeout(prerollTimer); prerollTimer = null; }
+  }
   switch (t.state) {
     case 'idle':    pause(); show('Nothing scheduled', ''); break;
-    case 'waiting': pause(); show('Starting in ' + fmt(t.in), ''); break;
+    case 'waiting': pause(); show('Starting in ' + countdown(t.in), ''); break;
+    case 'preroll':
+      // Hold still on the frame it starts from -- the buffer fills there
+      // while we wait -- and begin when the clock says, not a tick later.
+      if (!video.paused) video.pause();
+      if (prerollAt !== t.at && video.readyState >= 1) {
+        prerollAt = t.at;
+        video.currentTime = t.pos;
+        trace('preroll: parked at ' + t.pos.toFixed(2) + ', ' + t.in.toFixed(1) + 's to go');
+      }
+      if (prerollAt === t.at && !prerollTimer && t.in * 1000 - playLatency * 1000 <= 400) {
+        prerollTimer = setTimeout(function () {
+          prerollTimer = null;
+          trace('preroll: starting, ' + bufferedAhead().toFixed(1) + 's buffered ahead');
+          video.play().catch(function () {});
+          tick();
+        }, Math.max(0, t.in * 1000 - playLatency * 1000));
+      }
+      if (t.card) {
+        if (!$('intermission').classList.contains('on')) $('intermission').classList.add('on');
+        $('iline').textContent = 'Back in ' + countdown(t.in);
+        ensureMusic();
+        if (t.in <= FADE_OUT_MS / 1000 && !fadeTimer && !music.paused) fadeOutMusic();
+        if (needGesture) show('Tap for sound', '', true); else hide();
+      } else {
+        show('Starting in ' + countdown(t.in), '');
+      }
+      hud = 'starting in ' + t.in.toFixed(1) + 's at ' + fmt(t.pos) +
+        ', ' + bufferedAhead().toFixed(1) + 's buffered\n';
+      break;
     case 'loading': pause(); show('Loading…', ''); break;
     case 'error':
       pause();
@@ -693,6 +750,7 @@ function tick() {
       pause();
       ensureMusic();
       if (!$('intermission').classList.contains('on')) $('intermission').classList.add('on');
+      $('iline').textContent = "We'll be right back";
       if (needGesture) show('Tap for sound', '', true); else hide();
       hud = 'intermission ' + fmt((serverNow() - intermission) / 1000) + (music.paused ? '  (music not playing)' : '') + '\n';
       break;
@@ -716,12 +774,23 @@ function tick() {
         (keyframeMode ? '  keyframe player' : '') + (holdWorks === false ? '  no holds' : '') + (backoff ? '  backoff ' + backoff : '') + '\n';
       break;
   }
-  $('unmute').classList.toggle('hidden', !((t.state === 'playing' && video.muted || t.state === 'intermission' && music.muted) && !needGesture));
+  $('unmute').classList.toggle('hidden', !((t.state === 'playing' && video.muted ||
+    (t.state === 'intermission' || t.state === 'preroll' && t.card) && music.muted) && !needGesture));
   $('hud').textContent = hud + 'clock offset ' + offset.toFixed(0) + 'ms  rtt ' + (isNaN(offsetRtt) ? '?' : offsetRtt + 'ms') +
     '  ' + ua();
 }
 
 function pause() { if (!video.paused) video.pause(); }
+// Seconds, as a number while it is short enough to read as one.
+function countdown(s) { return s < 60 ? String(Math.max(0, Math.ceil(s))) : fmt(s); }
+// How much is buffered from where the element is sitting.
+function bufferedAhead() {
+  var ct = video.currentTime;
+  for (var i = 0; i < video.buffered.length; i++) {
+    if (video.buffered.start(i) <= ct + 0.1 && video.buffered.end(i) >= ct) return video.buffered.end(i) - ct;
+  }
+  return 0;
+}
 function show(title, sub, join) {
   $('overlay').classList.remove('hidden');
   $('title').textContent = title; $('sub').textContent = sub || '';

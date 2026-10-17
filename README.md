@@ -59,10 +59,21 @@ after it is due plus whatever the browser takes to open the file.
 
 The admin page's **Intermission** button pauses the film for everyone: the
 viewer shows a "We'll be right back" card and plays music on a loop;
-ending it resumes the film 10 s before where it was paused, so the
+ending it starts a **10 second countdown** rather than resuming at once:
+every viewer parks on the exact frame the film will resume at and fills
+its buffer there, so they all start together instead of each stuttering
+in. The card counts down, the music plays under it and fades out as the
+picture returns. It resumes 10 s before where it was paused, so the
 audience picks the thread up (the schedule's start moves forward by the
-intermission's length plus 10 s, never past the film's own beginning; a
-film that had not started yet keeps its countdown). Both switches are
+intermission's length plus the rewind plus the countdown, never past the
+film's own beginning; a film that had not started yet keeps its own
+countdown).
+
+Starting content works the same way: **Start now** means ten seconds from
+now, which viewers spend parked on the first frame with the buffer
+filling. Measured locally: 14-30 s buffered before anything plays, and
+the picture begins within a frame of the moment. An explicit start time
+is obeyed exactly, including one in the past. Both switches are
 instant: the film stays loaded and merely pauses under the card, the
 music is loaded when the page loads and cached, and the card is CSS,
 painted in advance. The music is a built-in ambient pad unless the media
@@ -168,7 +179,7 @@ ffmpeg -f lavfi -i testsrc=size=640x360:rate=30 -f lavfi -i sine=frequency=440:s
 | GET | `/api/state` | – | `{server_now_ms, version, schedule}` |
 | GET | `/api/events` | – | SSE, the same object on every change |
 | GET | `/api/files` | admin | playable files in the media dir |
-| POST | `/api/schedule` | admin | `{files: [..], start_ms?, loop?, then?}` — `start_ms` absent means now, `files` may be a single `file` |
+| POST | `/api/schedule` | admin | `{files: [..], start_ms?, loop?, then?}` — `start_ms` absent means ten seconds from now, `files` may be a single `file` |
 | DELETE | `/api/schedule` | admin | stop |
 | POST | `/api/intermission` | admin | pause the film for everyone, play music |
 | DELETE | `/api/intermission` | admin | resume where it was paused |
@@ -177,7 +188,8 @@ ffmpeg -f lavfi -i testsrc=size=640x360:rate=30 -f lavfi -i sine=frequency=440:s
 
 `schedule` is `{items: [{file, duration_ms}], start_ms, loop, then}` or
 `null`, where `then` is an item or `null`; `intermission_since_ms` is set
-while an intermission is on. `/api/files` gives each file's `duration_ms`,
+while an intermission is on, and `resume_at_ms` is the moment the film
+starts again after one. `/api/files` gives each file's `duration_ms`,
 or `null` when it could not be read. Admin calls send
 `Authorization: Bearer <token>`.
 

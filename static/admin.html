@@ -39,7 +39,7 @@
   <h2>Now playing</h2>
   <div id="status">Connecting…</div>
   <div style="margin-top:12px"><button id="intermission">Intermission</button><button id="stop" class="quiet">Stop</button> <a href="/" target="_blank" style="color:#9cf">open viewer ↗</a></div>
-  <small>Intermission pauses the film for everyone and plays music; ending it resumes 10 seconds before where it left off.</small>
+  <small>Intermission pauses the film for everyone and plays music. Ending it starts a 10 second countdown, which every viewer spends buffering the exact frame it resumes at — 10 seconds before where it left off — so they all start together. Starting any content works the same way.</small>
 </section>
 
 <section>
@@ -235,7 +235,9 @@ function render() {
   if (!state) return;
   const s = state.schedule, im = state.intermission_since_ms;
   $('intermission').textContent = im ? `End intermission (${fmt((Date.now() + offset - im) / 1000)})` : 'Intermission';
-  let head = im ? `INTERMISSION, ${fmt((Date.now() + offset - im) / 1000)} so far\n` : '';
+  const backIn = state.resume_at_ms ? (state.resume_at_ms - (Date.now() + offset)) / 1000 : 0;
+  let head = im ? `INTERMISSION, ${fmt((Date.now() + offset - im) / 1000)} so far\n`
+    : backIn > 0 ? `BACK IN ${Math.ceil(backIn)} — everyone is buffering the resume point\n` : '';
   if (!s) { $('status').textContent = head + 'Nothing scheduled.'; return; }
   const when = new Date(s.start_ms).toLocaleString();
   const total = s.items.reduce((a, i) => a + i.duration_ms, 0) / 1000;
