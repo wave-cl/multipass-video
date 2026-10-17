@@ -1,7 +1,8 @@
 # multipass-video
 
-Schedule one video file on disk to play for every viewer at the same moment —
-now or at a set time, once or looping. One binary, no build step for the
+Schedule a video — or a playlist of them — to play for every viewer at the
+same moment, now or at a set time, once or looping, with something else
+looping after the list has played out. One binary, no build step for the
 front end, no transcoding.
 
 ## How it stays in sync
@@ -12,9 +13,16 @@ loop flag — together with its own clock. Each viewer:
 
 1. estimates the server-clock offset from a few `/api/state` round trips
    (lowest RTT wins, refreshed every 30 s);
-2. computes where it should be: `(server_now − start) mod duration`;
+2. computes which item of the playlist is on and where in it, by walking
+   the items' durations from `start`;
 3. seeks if it is more than 0.5 s off, otherwise bends `playbackRate` by up to
    ±8 % until the drift is under 50 ms.
+
+The durations are the **server's**, read once when the playlist is
+scheduled — from the MP4 movie header directly, or from ffprobe for the
+formats that reader does not know. A viewer that trusted its own decoder
+would put the boundary between two items in a slightly different place
+from everyone else.
 
 Viewers therefore agree with the server, not with each other, so a late
 joiner lands in the right place and nobody waits for anybody. Measured on
@@ -29,6 +37,23 @@ on Apple silicon — each holding the binary and this README. Or build it:
 ```bash
 cargo install --path .
 ```
+
+## Playlists
+
+The admin page builds a queue: pick a file, **Add**, reorder with ↑ ↓,
+drop with ×. The list plays in order from the start time. After it, one
+of two things:
+
+- **Loop the whole playlist** — the list repeats forever, or
+- **Then loop** — the named file plays on repeat once the list has played
+  out. (The two are mutually exclusive; a looping list never reaches what
+  follows it, and the server refuses the pair.)
+
+With neither, the stream ends when the list does. A file whose length
+cannot be read cannot be queued: without it the boundary is unknown.
+Item boundaries are switched on a timer aimed at the exact moment, not
+on the next quarter-second tick, so the next item starts about 30 ms
+after it is due plus whatever the browser takes to open the file.
 
 ## Intermission
 
@@ -143,21 +168,22 @@ ffmpeg -f lavfi -i testsrc=size=640x360:rate=30 -f lavfi -i sine=frequency=440:s
 | GET | `/api/state` | – | `{server_now_ms, version, schedule}` |
 | GET | `/api/events` | – | SSE, the same object on every change |
 | GET | `/api/files` | admin | playable files in the media dir |
-| POST | `/api/schedule` | admin | `{file, start_ms?, loop?}` — `start_ms` absent means now |
+| POST | `/api/schedule` | admin | `{files: [..], start_ms?, loop?, then?}` — `start_ms` absent means now, `files` may be a single `file` |
 | DELETE | `/api/schedule` | admin | stop |
 | POST | `/api/intermission` | admin | pause the film for everyone, play music |
 | DELETE | `/api/intermission` | admin | resume where it was paused |
 | GET | `/intermission-audio` | – | the music, with range support |
 | GET | `/media/<file>` | – | the file, with range support |
 
-`schedule` is `{file, start_ms, loop}` or `null`; `intermission_since_ms` is
-set while an intermission is on. Admin calls send
+`schedule` is `{items: [{file, duration_ms}], start_ms, loop, then}` or
+`null`, where `then` is an item or `null`; `intermission_since_ms` is set
+while an intermission is on. `/api/files` gives each file's `duration_ms`,
+or `null` when it could not be read. Admin calls send
 `Authorization: Bearer <token>`.
 
 ## Not done (yet)
 
 - Transcoding / HLS for files browsers cannot play.
-- A playlist — one file at a time.
 - Chat, viewer count, or anything social.
 
 ## Deploying

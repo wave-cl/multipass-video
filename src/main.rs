@@ -83,13 +83,39 @@ struct Args {
     viewer_key_file: Option<PathBuf>,
 }
 
-/// What is scheduled. `start_ms` is unix milliseconds on the server clock.
+/// One entry of a playlist. The duration is the server's, read once when
+/// the playlist is scheduled, so every viewer agrees on where the
+/// boundaries are rather than each trusting its own decoder.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct Item {
+    file: String,
+    duration_ms: i64,
+}
+
+/// What is scheduled: a playlist played in order from `start_ms`, which is
+/// unix milliseconds on the server clock. When it has played out, `then`
+/// (if set) loops forever; with `loop` the list itself repeats instead.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct Schedule {
-    file: String,
+    /// Defaulted so a pre-0.4 state file, which has no `items`, still
+    /// parses and can be migrated rather than thrown away whole.
+    #[serde(default)]
+    items: Vec<Item>,
     start_ms: i64,
-    #[serde(rename = "loop")]
+    #[serde(rename = "loop", default)]
     loop_: bool,
+    #[serde(default)]
+    then: Option<Item>,
+    /// Schedules written before 0.4 named one file and no duration. Read
+    /// back here and migrated at startup; never written again.
+    #[serde(default, skip_serializing)]
+    file: Option<String>,
+}
+
+impl Schedule {
+    fn total_ms(&self) -> i64 {
+        self.items.iter().map(|i| i.duration_ms).sum()
+    }
 }
 
 /// The persisted state. `version` bumps on every change so clients can tell
@@ -117,6 +143,9 @@ struct StateView {
 struct FileEntry {
     name: String,
     size: u64,
+    /// None when neither the MP4 header nor ffprobe could say; such a file
+    /// cannot be put in a playlist, because its boundary is unknown.
+    duration_ms: Option<i64>,
 }
 
 /// A viewer's own account of what its player did, sent only when opened
@@ -131,11 +160,20 @@ struct TraceBody {
 
 #[derive(Deserialize)]
 struct ScheduleRequest {
-    file: String,
+    /// The playlist, in order.
+    #[serde(default)]
+    files: Vec<String>,
+    /// A single file, as the API took before 0.4: a playlist of one.
+    #[serde(default)]
+    file: Option<String>,
     /// Absent or null means "now".
     start_ms: Option<i64>,
+    /// Repeat the whole list forever.
     #[serde(rename = "loop", default)]
     loop_: bool,
+    /// What loops once the list has played out.
+    #[serde(default)]
+    then: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -178,6 +216,141 @@ fn playable(name: &str) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| PLAYABLE.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// The first box of type `want` between `start` and `end`, as the range its
+/// contents occupy. ISO-BMFF boxes are [u32 size][4cc type], with size 1
+/// meaning a 64-bit size follows and 0 meaning "to the end".
+fn find_box(
+    f: &mut std::fs::File,
+    start: u64,
+    end: u64,
+    want: &[u8; 4],
+) -> std::io::Result<Option<(u64, u64)>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut pos = start;
+    while pos + 8 <= end {
+        f.seek(SeekFrom::Start(pos))?;
+        let mut h = [0u8; 8];
+        if f.read_exact(&mut h).is_err() {
+            return Ok(None);
+        }
+        let typ: [u8; 4] = h[4..8].try_into().unwrap();
+        let size32 = u32::from_be_bytes(h[0..4].try_into().unwrap()) as u64;
+        let (size, header) = match size32 {
+            1 => {
+                let mut e = [0u8; 8];
+                f.read_exact(&mut e)?;
+                (u64::from_be_bytes(e), 16)
+            }
+            0 => (end - pos, 8),
+            n => (n, 8),
+        };
+        if size < header || pos + size > end {
+            return Ok(None); // malformed; do not guess
+        }
+        if &typ == want {
+            return Ok(Some((pos + header, pos + size)));
+        }
+        pos += size;
+    }
+    Ok(None)
+}
+
+/// How long an MP4/M4V/MOV plays, from `moov`/`mvhd`. None if the file is
+/// not ISO-BMFF, or is fragmented and says zero.
+fn mp4_duration_ms(path: &Path) -> std::io::Result<Option<i64>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let Some((moov, moov_end)) = find_box(&mut f, 0, len, b"moov")? else {
+        return Ok(None);
+    };
+    let Some((mvhd, _)) = find_box(&mut f, moov, moov_end, b"mvhd")? else {
+        return Ok(None);
+    };
+    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(mvhd))?;
+    let mut version = [0u8; 4]; // version + flags
+    f.read_exact(&mut version)?;
+    let (timescale, duration) = if version[0] == 1 {
+        let mut b = [0u8; 28]; // creation(8) modification(8) timescale(4) duration(8)
+        f.read_exact(&mut b)?;
+        (
+            u32::from_be_bytes(b[16..20].try_into().unwrap()) as u64,
+            u64::from_be_bytes(b[20..28].try_into().unwrap()),
+        )
+    } else {
+        let mut b = [0u8; 16]; // creation(4) modification(4) timescale(4) duration(4)
+        f.read_exact(&mut b)?;
+        (
+            u32::from_be_bytes(b[8..12].try_into().unwrap()) as u64,
+            u32::from_be_bytes(b[12..16].try_into().unwrap()) as u64,
+        )
+    };
+    if timescale == 0 || duration == 0 {
+        return Ok(None);
+    }
+    Ok(Some((duration as i128 * 1000 / timescale as i128) as i64))
+}
+
+/// Ask ffprobe, for the formats the MP4 reader does not know (WebM, Ogg).
+/// Absent ffprobe is not an error: the file simply has no known duration.
+fn ffprobe_duration_ms(path: &Path) -> Option<i64> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let secs: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (secs > 0.0).then(|| (secs * 1000.0).round() as i64)
+}
+
+/// How long a file plays. Blocking: a few seeks for an MP4, a process for
+/// anything else.
+fn probe_duration_ms(path: &Path) -> Option<i64> {
+    match mp4_duration_ms(path) {
+        Ok(Some(ms)) => return Some(ms),
+        Ok(None) => {}
+        Err(e) => warn!("{}: {e}", path.display()),
+    }
+    ffprobe_duration_ms(path)
+}
+
+/// Check a name and read its duration, or say which of the two failed.
+fn item_for(media_dir: &Path, name: &str) -> Result<Item, (StatusCode, String)> {
+    if !valid_file_name(name) || !playable(name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{name}: not a playable file name"),
+        ));
+    }
+    let path = media_dir.join(name);
+    if !path.is_file() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("{name}: no such file in the media directory"),
+        ));
+    }
+    match probe_duration_ms(&path) {
+        Some(duration_ms) => Ok(Item {
+            file: name.to_string(),
+            duration_ms,
+        }),
+        None => Err((
+            StatusCode::BAD_REQUEST,
+            format!("{name}: cannot tell how long it is, so it cannot be scheduled"),
+        )),
+    }
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -239,8 +412,8 @@ fn persist(path: &Path, state: &Persisted) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-fn load_state(path: &Path) -> Persisted {
-    match std::fs::read(path) {
+fn load_state(path: &Path, media_dir: &Path) -> Persisted {
+    let mut state: Persisted = match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(s) => s,
             Err(e) => {
@@ -249,7 +422,30 @@ fn load_state(path: &Path) -> Persisted {
             }
         },
         Err(_) => Persisted::default(),
+    };
+    // A schedule written before 0.4 names one file and carries no duration.
+    // Give it one, so what was playing keeps playing across the upgrade.
+    if let Some(sch) = &mut state.schedule {
+        if sch.items.is_empty() {
+            match sch.file.take() {
+                Some(file) => match item_for(media_dir, &file) {
+                    Ok(item) => {
+                        info!("migrated the schedule of {file} to a playlist of one");
+                        sch.items = vec![item];
+                    }
+                    Err((_, why)) => {
+                        warn!("dropping the stored schedule: {why}");
+                        state.schedule = None;
+                    }
+                },
+                None => {
+                    warn!("dropping a stored schedule with no files");
+                    state.schedule = None;
+                }
+            }
+        }
     }
+    state
 }
 
 /// Read a secret from a file, or mint one into it (0600). The admin token
@@ -407,9 +603,20 @@ async fn list_files(
         out.push(FileEntry {
             name,
             size: meta.len(),
+            duration_ms: None,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    // Probing reads headers and may run ffprobe, so it goes off the runtime.
+    let media_dir = app.media_dir.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        for e in &mut out {
+            e.duration_ms = probe_duration_ms(&media_dir.join(&e.name));
+        }
+        out
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(out))
 }
 
@@ -420,21 +627,47 @@ async fn set_schedule(
 ) -> Result<Json<StateView>, (StatusCode, String)> {
     app.require_admin(&headers)
         .map_err(|s| (s, "admin token required".into()))?;
-    if !valid_file_name(&req.file) || !playable(&req.file) {
-        return Err((StatusCode::BAD_REQUEST, "not a playable file name".into()));
+    let mut names = req.files;
+    names.extend(req.file); // one `file` is a playlist of one
+    if names.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "no files given".into()));
     }
-    if !app.media_dir.join(&req.file).is_file() {
+    if req.loop_ && req.then.is_some() {
         return Err((
-            StatusCode::NOT_FOUND,
-            "no such file in the media directory".into(),
+            StatusCode::BAD_REQUEST,
+            "a looping playlist never reaches `then`".into(),
         ));
     }
+    // Reading durations is blocking work; do it off the runtime.
+    let media_dir = app.media_dir.clone();
+    let then_name = req.then;
+    let (items, then) = tokio::task::spawn_blocking(move || {
+        let items = names
+            .iter()
+            .map(|n| item_for(&media_dir, n))
+            .collect::<Result<Vec<_>, _>>()?;
+        let then = then_name
+            .as_deref()
+            .map(|n| item_for(&media_dir, n))
+            .transpose()?;
+        Ok::<_, (StatusCode, String)>((items, then))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     let schedule = Schedule {
-        file: req.file,
+        items,
         start_ms: req.start_ms.unwrap_or_else(now_ms),
         loop_: req.loop_,
+        then,
+        file: None,
     };
-    info!(?schedule, "scheduled");
+    info!(
+        files = schedule.items.len(),
+        total_s = schedule.total_ms() / 1000,
+        then = schedule.then.as_ref().map(|i| i.file.as_str()),
+        loop_ = schedule.loop_,
+        "scheduled"
+    );
     app.set(Some(schedule))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(app.view()))
@@ -602,7 +835,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let state = load_state(&args.state_file);
+    let state = load_state(&args.state_file, &args.media_dir);
     if let Some(s) = &state.schedule {
         info!(?s, "restored schedule");
     }
@@ -663,9 +896,73 @@ mod tests {
         assert!(!ct_eq(b"", b"a"));
     }
 
-    fn test_app(viewer_key: Option<&str>) -> Router {
-        let dir = std::env::temp_dir().join(format!("multipass-test-{}", std::process::id()));
+    /// A file with nothing in it but a movie header: enough for the
+    /// duration reader, and the smallest thing the scheduler accepts.
+    fn fake_mp4(duration_ms: u32) -> Vec<u8> {
+        let mut mvhd = vec![0u8; 4]; // version 0 + flags
+        mvhd.extend_from_slice(&0u32.to_be_bytes()); // creation
+        mvhd.extend_from_slice(&0u32.to_be_bytes()); // modification
+        mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale: ms
+        mvhd.extend_from_slice(&duration_ms.to_be_bytes());
+        let mut v = Vec::new();
+        v.extend_from_slice(&16u32.to_be_bytes());
+        v.extend_from_slice(b"ftypisom");
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v.extend_from_slice(&((16 + mvhd.len()) as u32).to_be_bytes());
+        v.extend_from_slice(b"moov");
+        v.extend_from_slice(&((8 + mvhd.len()) as u32).to_be_bytes());
+        v.extend_from_slice(b"mvhd");
+        v.extend_from_slice(&mvhd);
+        v
+    }
+
+    #[test]
+    fn a_movie_header_gives_the_duration() {
+        let dir = test_dir("mp4");
+
+        let p = dir.join("v0.mp4");
+        std::fs::write(&p, fake_mp4(94_000)).unwrap();
+        assert_eq!(mp4_duration_ms(&p).unwrap(), Some(94_000));
+
+        // The 64-bit header, which long recordings use.
+        let mut mvhd = vec![1u8, 0, 0, 0];
+        mvhd.extend_from_slice(&[0u8; 16]); // creation + modification
+        mvhd.extend_from_slice(&90_000u32.to_be_bytes()); // timescale
+        mvhd.extend_from_slice(&(90_000u64 * 42).to_be_bytes()); // 42 s
+        let mut v = Vec::new();
+        v.extend_from_slice(&((16 + mvhd.len()) as u32).to_be_bytes());
+        v.extend_from_slice(b"moov");
+        v.extend_from_slice(&((8 + mvhd.len()) as u32).to_be_bytes());
+        v.extend_from_slice(b"mvhd");
+        v.extend_from_slice(&mvhd);
+        let p = dir.join("v1.mp4");
+        std::fs::write(&p, v).unwrap();
+        assert_eq!(mp4_duration_ms(&p).unwrap(), Some(42_000));
+
+        // Not an MP4 at all, and a truncated one: no answer, no panic.
+        let p = dir.join("junk.mp4");
+        std::fs::write(&p, b"not an mp4 at all").unwrap();
+        assert_eq!(mp4_duration_ms(&p).unwrap(), None);
+        let p = dir.join("short.mp4");
+        std::fs::write(&p, &fake_mp4(1000)[..20]).unwrap();
+        assert_eq!(mp4_duration_ms(&p).unwrap(), None);
+    }
+
+    /// A directory of this test's own: tests run at once in one process,
+    /// and sharing a state file makes one test's write fail inside another.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("multipass-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_app(name: &str, viewer_key: Option<&str>) -> Router {
+        test_app_in(&test_dir(name), viewer_key)
+    }
+
+    fn test_app_in(dir: &Path, viewer_key: Option<&str>) -> Router {
+        let dir = dir.to_path_buf();
         let (notify, _) = watch::channel(0);
         let app: App = Arc::new(Inner {
             media_dir: dir.clone(),
@@ -692,13 +989,13 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_viewer_key_anyone_can_watch() {
-        let app = test_app(None);
+        let app = test_app("open", None);
         assert_eq!(call(&app, get("/api/state")).await.0, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn with_a_viewer_key_everything_needs_the_cookie() {
-        let app = test_app(Some("hunter2"));
+        let app = test_app("cookie", Some("hunter2"));
         // API and media: 401. A browser asking for a page: sent to /login.
         for path in ["/api/state", "/api/events", "/media/x.mp4", "/api/files"] {
             assert_eq!(
@@ -756,7 +1053,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_logins_are_served_one_at_a_time() {
-        let app = test_app(Some("abcde"));
+        let app = test_app("logins", Some("abcde"));
         let login = || {
             Request::post("/login")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -777,9 +1074,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_playlist_plays_in_order_and_then_loops_the_last_thing() {
+        use http_body_util::BodyExt;
+        let dir = test_dir("playlist");
+        let app = test_app_in(&dir, None);
+        std::fs::write(dir.join("a.mp4"), fake_mp4(20_000)).unwrap();
+        std::fs::write(dir.join("b.mp4"), fake_mp4(30_000)).unwrap();
+        std::fs::write(dir.join("clock.mp4"), fake_mp4(5_000)).unwrap();
+
+        let post = |body: String| {
+            Request::post("/api/schedule")
+                .header(header::AUTHORIZATION, "Bearer admin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.into())
+                .unwrap()
+        };
+        let state = |app: &Router| {
+            let app = app.clone();
+            async move {
+                use tower::ServiceExt;
+                let res = app.oneshot(get("/api/state")).await.unwrap();
+                let body = res.into_body().collect().await.unwrap().to_bytes();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+
+        let req = post(r#"{"files":["a.mp4","b.mp4"],"then":"clock.mp4"}"#.into());
+        assert_eq!(call(&app, req).await.0, StatusCode::OK);
+        let s = state(&app).await;
+        let items = s["schedule"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["file"], "a.mp4");
+        assert_eq!(items[0]["duration_ms"], 20_000);
+        assert_eq!(items[1]["duration_ms"], 30_000);
+        assert_eq!(s["schedule"]["then"]["file"], "clock.mp4");
+        assert_eq!(s["schedule"]["then"]["duration_ms"], 5_000);
+        assert_eq!(s["schedule"]["loop"], false);
+
+        // One `file` is still a playlist of one.
+        let req = post(r#"{"file":"a.mp4","loop":true}"#.into());
+        assert_eq!(call(&app, req).await.0, StatusCode::OK);
+        let s = state(&app).await;
+        assert_eq!(s["schedule"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(s["schedule"]["loop"], true);
+
+        // Refusals: nothing to play, a file that is not there, one whose
+        // length cannot be read, and a loop that would never reach `then`.
+        std::fs::write(dir.join("mystery.mp4"), b"not an mp4").unwrap();
+        for (body, want) in [
+            (r#"{"files":[]}"#, StatusCode::BAD_REQUEST),
+            (r#"{"files":["nope.mp4"]}"#, StatusCode::NOT_FOUND),
+            (r#"{"files":["../etc/passwd"]}"#, StatusCode::BAD_REQUEST),
+            (r#"{"files":["mystery.mp4"]}"#, StatusCode::BAD_REQUEST),
+            (
+                r#"{"files":["a.mp4"],"loop":true,"then":"clock.mp4"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            assert_eq!(call(&app, post(body.into())).await.0, want, "{body}");
+        }
+        // ... and none of them disturbed what was already scheduled.
+        let s = state(&app).await;
+        assert_eq!(s["schedule"]["items"][0]["file"], "a.mp4");
+    }
+
+    #[tokio::test]
+    async fn a_schedule_written_before_playlists_still_plays() {
+        let dir = test_dir("legacy");
+        std::fs::write(dir.join("old.mp4"), fake_mp4(123_000)).unwrap();
+        let state_file = dir.join("state.json");
+        std::fs::write(
+            &state_file,
+            br#"{"version":7,"schedule":{"file":"old.mp4","start_ms":1000,"loop":true}}"#,
+        )
+        .unwrap();
+
+        let state = load_state(&state_file, &dir);
+        let sch = state.schedule.expect("the schedule survives the upgrade");
+        assert_eq!(state.version, 7);
+        assert_eq!(
+            sch.items,
+            vec![Item {
+                file: "old.mp4".into(),
+                duration_ms: 123_000
+            }]
+        );
+        assert_eq!(sch.start_ms, 1000);
+        assert!(sch.loop_);
+
+        // A legacy schedule whose file has since gone is dropped, not kept
+        // as something unplayable.
+        std::fs::remove_file(dir.join("old.mp4")).unwrap();
+        assert!(load_state(&state_file, &dir).schedule.is_none());
+    }
+
+    #[tokio::test]
     async fn an_intermission_pauses_a_running_film_and_not_a_countdown() {
         use http_body_util::BodyExt;
-        let app = test_app(None);
+        let dir = test_dir("intermission");
+        let app = test_app_in(&dir, None);
         let admin =
             |req: axum::http::request::Builder| req.header(header::AUTHORIZATION, "Bearer admin");
         let state = |app: &Router| {
@@ -791,8 +1184,7 @@ mod tests {
                 serde_json::from_slice::<serde_json::Value>(&body).unwrap()
             }
         };
-        let dir = std::env::temp_dir().join(format!("multipass-test-{}", std::process::id()));
-        std::fs::write(dir.join("f.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("f.mp4"), fake_mp4(600_000)).unwrap();
 
         // A film that started 100 s ago.
         let started = now_ms() - 100_000;
@@ -876,12 +1268,20 @@ mod tests {
     #[test]
     fn schedule_round_trips_with_loop_key() {
         let s = Schedule {
-            file: "a.mp4".into(),
+            items: vec![Item {
+                file: "a.mp4".into(),
+                duration_ms: 20_000,
+            }],
             start_ms: 5,
             loop_: true,
+            then: None,
+            file: None,
         };
         let j = serde_json::to_string(&s).unwrap();
         assert!(j.contains("\"loop\":true"), "{j}");
+        // The legacy name is read, never written: a state file written by
+        // this version must not grow a field that migration would re-read.
+        assert!(!j.contains("\"file\":null"), "{j}");
         assert_eq!(serde_json::from_str::<Schedule>(&j).unwrap(), s);
     }
 }

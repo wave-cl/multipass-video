@@ -85,11 +85,14 @@ music.load();
 if (TRACE_EARLY) music.addEventListener('canplaythrough', function () { trace('music preloaded, ' + (music.buffered.length ? music.buffered.end(music.buffered.length - 1).toFixed(0) : '?') + ' s buffered'); });
 
 // --- what the server says -------------------------------------------------
-var schedule = null;      // {file, start_ms, loop} or null
+var schedule = null;      // {items, start_ms, loop, then} or null
 var intermission = null;  // when it began (server ms), or null
 var version = -1;
 var loadedFile = null;    // what the video element holds
-var duration = NaN;       // of the loaded file, seconds
+var duration = NaN;       // of the loaded file, seconds, from the element
+var itemDur = NaN;        // ...and what the server says, which sets the boundary
+var itemLoops = false;    // whether this item is the one that repeats
+var boundaryTimer = null; // fires tick() exactly when this item runs out
 var loadError = false;
 
 // --- clock ----------------------------------------------------------------
@@ -176,25 +179,12 @@ function apply(s) {
   schedule = s.schedule;
   intermission = s.intermission_since_ms;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-  // The film stays in the element across an intermission: it pauses under
+  // Which file to hold is the clock's business, decided in tick(): a
+  // playlist's item changes with time, not only with the schedule. The
+  // film stays in the element across an intermission -- it pauses under
   // the card and resumes from the same frame, with no reload and no black.
-  // Only a different file is loaded.
-  var want = schedule ? schedule.file : null;
-  if (want !== loadedFile) resetController(); else resetTransient();
-  if (want !== loadedFile) {
-    loadedFile = want;
-    duration = NaN; loadError = false; loadErrors = 0;
-    if (want) {
-      video.src = '/media/' + encodeURIComponent(want);
-      video.loop = schedule.loop;   // the element wraps by itself; we only correct
-      video.load();
-    } else {
-      video.removeAttribute('src');
-      video.load();
-    }
-  } else if (schedule) {
-    video.loop = schedule.loop;
-  }
+  resetTransient();
+  if (!schedule) unload();
   if (intermission && !was) {
     trace('intermission: pausing at ' + video.currentTime.toFixed(3));
     var t0 = Date.now();
@@ -246,6 +236,31 @@ function fadeOutMusic() {
 
 video.addEventListener('loadedmetadata', function () { duration = video.duration; loadErrors = 0; });
 
+// Put an item in the element and remember how long the *server* says it
+// is: the boundary every viewer switches on is the server's, not this
+// decoder's. What the controller has learned about the player -- its
+// stall, its rate verdict -- belongs to the player, not the file, so it
+// survives the change.
+function loadItem(it) {
+  trace('item ' + (it.idx >= 0 ? (it.idx + 1) : 'then') + ' ' + it.file +
+    ' at ' + it.pos.toFixed(2) + ' of ' + it.dur.toFixed(2) + (it.loops ? ' (loops)' : ''));
+  loadedFile = it.file; itemDur = it.dur; itemLoops = !!it.loops;
+  duration = NaN; loadError = false; loadErrors = 0;
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  if (boundaryTimer) { clearTimeout(boundaryTimer); boundaryTimer = null; }
+  resetTransient();
+  video.src = '/media/' + encodeURIComponent(it.file);
+  video.loop = !!it.loops;   // a repeating item wraps itself; we only correct
+  video.load();
+}
+
+function unload() {
+  if (!loadedFile) return;
+  loadedFile = null; itemDur = NaN; itemLoops = false; duration = NaN;
+  video.removeAttribute('src');
+  video.load();
+}
+
 // A media error is usually a blip -- the server restarting, the network
 // dropping -- and a page that gives up on it strands the viewer until they
 // reload. So reload the element ourselves, backing off, and only call the
@@ -260,7 +275,7 @@ video.addEventListener('error', function () {
     if (!schedule) return;
     loadError = false; duration = NaN;
     resetController();
-    video.src = '/media/' + encodeURIComponent(schedule.file) + '?r=' + loadErrors;
+    video.src = '/media/' + encodeURIComponent(loadedFile) + '?r=' + loadErrors;
     video.load();
   }, Math.min(30000, 2000 * Math.pow(2, loadErrors - 1)));
 });
@@ -356,24 +371,54 @@ function poke() {
 poke();
 
 // --- playback: staying in sync --------------------------------------------
+// Which item of the playlist is on t seconds after the start, and where in
+// it. The durations are the server's, so every viewer puts the boundaries
+// in the same place. null once the list has played out with nothing to
+// follow it.
+function itemAt(t) {
+  var items = (schedule && schedule.items) || [];
+  var total = 0, i, d;
+  for (i = 0; i < items.length; i++) total += items[i].duration_ms / 1000;
+  if (!(total > 0)) return null;
+  if (schedule.loop) t = ((t % total) + total) % total;
+  if (t < total) {
+    var acc = 0;
+    for (i = 0; i < items.length; i++) {
+      d = items[i].duration_ms / 1000;
+      if (t < acc + d) {
+        return {file: items[i].file, dur: d, pos: t - acc, idx: i,
+                // Only a list of one can leave the wrapping to the element.
+                loops: !!schedule.loop && items.length === 1};
+      }
+      acc += d;
+    }
+  }
+  if (schedule.then) {
+    d = schedule.then.duration_ms / 1000;
+    return {file: schedule.then.file, dur: d, pos: ((t - total) % d + d) % d, idx: -1, loops: true};
+  }
+  return null;
+}
+
 // Where the schedule says we should be right now.
 function target() {
   if (intermission) return {state: 'intermission'};
   if (!schedule) return {state: 'idle'};
   var t = (serverNow() - schedule.start_ms) / 1000;
   if (t < 0) return {state: 'waiting', in: -t};
-  if (loadError) return {state: 'error'};
-  if (isNaN(duration)) return {state: 'loading'};
-  if (schedule.loop) return {state: 'playing', pos: t % duration};
-  if (t >= duration) return {state: 'ended'};
-  return {state: 'playing', pos: t};
+  var it = itemAt(t);
+  if (!it) return {state: 'ended'};
+  if (it.file !== loadedFile) return {state: 'loading', item: it};
+  if (loadError) return {state: 'error', item: it};
+  if (isNaN(duration)) return {state: 'loading', item: it};
+  return {state: 'playing', pos: it.pos, item: it};
 }
 
 // Drift with the shortest way round the loop, so the wrap does not read as
 // a whole-duration error.
 function wrapDrift(d) {
-  if (!schedule.loop || !duration) return d;
-  return ((d + duration / 2) % duration + duration) % duration - duration / 2;
+  if (!itemLoops || !itemDur) return d;
+  return ((d + itemDur / 2) % itemDur + itemDur) % itemDur - itemDur / 2;
 }
 
 // Players differ in what they let us do. A desktop browser seeks to the
@@ -440,7 +485,7 @@ function seekTo(pos) {
   // Aim ahead by the latency the last seeks showed, and by a doubling step
   // while we are hunting for a keyframe past the target.
   var aim = pos + seekLatency + stall + (stepping ? 0.5 * Math.pow(2, stepping - 1) : 0);
-  if (schedule.loop && duration) aim = aim % duration;
+  if (itemLoops && itemDur) aim = aim % itemDur;
   video.currentTime = aim;
   seeks++;
   trace('seek pos=' + pos.toFixed(3) + ' aim=' + aim.toFixed(3) + ' step=' + stepping + ' lat=' + seekLatency.toFixed(3) + ' stall=' + stall.toFixed(3));
@@ -629,6 +674,7 @@ function correct(pos) {
 function tick() {
   var t = target();
   var hud = '';
+  if (t.item && t.item.file !== loadedFile) loadItem(t.item);
   if (t.state !== 'intermission') {
     if ($('intermission').classList.contains('on')) $('intermission').classList.remove('on');
     if (!music.paused && !fadeTimer) music.pause();
@@ -655,7 +701,15 @@ function tick() {
       if (needGesture) { show('Live', '', true); break; }
       hide();
       correct(t.pos);
-      hud = fmt(t.pos) + ' / ' + fmt(duration) + (schedule.loop ? ' ↻' : '') +
+      // An item that does not repeat ends at a known moment: switch on it,
+      // not at the next quarter-second tick.
+      var left = t.item.dur - t.pos;
+      if (!t.item.loops && left > 0 && left < 0.5 && !boundaryTimer) {
+        boundaryTimer = setTimeout(function () { boundaryTimer = null; tick(); }, left * 1000 + 30);
+      }
+      hud = (schedule.items.length > 1 || schedule.then ?
+              (t.item.idx >= 0 ? (t.item.idx + 1) + '/' + schedule.items.length : 'then') + '  ' : '') +
+        fmt(t.pos) + ' / ' + fmt(itemDur) + (itemLoops ? ' ↻' : '') +
         (holding ? '  HOLDING ' + ms(wrapDrift(video.currentTime - t.pos)) : '  drift ' + ms(lastDrift) + ' (avg ' + ms(smooth || 0) + ')') +
         '  rate ' + rateValue.toFixed(2) + (rateWorks === null ? ' ?' : rateWorks ? ' ok' : ' ignored') +
         '  seeks ' + seeks + ' holds ' + holds + (isNaN(seekErr) ? '' : ' landed ' + ms(seekErr) + ' off, ' + (seekLatency * 1000).toFixed(0) + 'ms late, stall ' + (stall * 1000).toFixed(0) + 'ms') +

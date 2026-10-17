@@ -18,6 +18,11 @@
   #msg{margin-top:10px;min-height:1.4em}
   #msg.err{color:#f66}
   small{opacity:.6}
+  #queue{margin:10px 0;padding-left:26px}
+  #queue li{padding:3px 0}
+  #queue li span.name{font-variant-numeric:tabular-nums}
+  #queue li button{font-size:13px;padding:2px 8px;margin:0 0 0 6px;background:#333;color:#eee}
+  #total{margin-bottom:10px}
 </style>
 </head>
 <body>
@@ -39,10 +44,14 @@
 <section>
   <h2>Schedule</h2>
   <form id="form">
-    <label>File <select id="file"><option value="">— load files with a token —</option></select></label>
+    <label>Add <select id="file"><option value="">— load files with a token —</option></select>
+      <button type="button" id="add" class="quiet">Add</button></label>
+    <ol id="queue"></ol>
+    <div id="total"><small>Nothing queued.</small></div>
     <label><input type="radio" name="when" value="now" checked> Start now</label>
     <label><input type="radio" name="when" value="at"> Start at <input type="datetime-local" id="at" step="1"></label>
-    <label><input type="checkbox" id="loop"> Loop</label>
+    <label><input type="checkbox" id="loop"> Loop the whole playlist</label>
+    <label>Then loop <select id="then"><option value="">— nothing, stop at the end —</option></select></label>
     <button type="submit">Start</button>
   </form>
   <div id="msg"></div>
@@ -65,36 +74,108 @@ $('forget').onclick = e => { e.preventDefault(); store.clear(); tokenEl.value = 
 function auth() { return {'Authorization': 'Bearer ' + tokenEl.value.trim()}; }
 function say(text, err) { $('msg').textContent = text; $('msg').className = err ? 'err' : ''; }
 
+let files = [], queue = [], prefilled = false;
+
 async function loadFiles() {
   store.set(tokenEl.value);
   if (!tokenEl.value.trim()) return;
   const r = await fetch('/api/files', {headers: auth()});
   if (!r.ok) { say(r.status === 401 ? 'Token rejected' : 'Could not list files (' + r.status + ')', true); return; }
-  const files = await r.json();
-  const sel = $('file');
+  files = await r.json();
+  const sel = $('file'), then = $('then');
   sel.innerHTML = files.length ? '' : '<option value="">(no playable files in the media directory)</option>';
+  then.innerHTML = '<option value="">— nothing, stop at the end —</option>';
   for (const f of files) {
-    const o = document.createElement('option');
-    o.value = f.name; o.textContent = `${f.name}  (${(f.size / 1e6).toFixed(1)} MB)`;
-    sel.appendChild(o);
+    const label = `${f.name}  (${f.duration_ms ? fmt(f.duration_ms / 1000) : 'length unknown'}, ${(f.size / 1e6).toFixed(0)} MB)`;
+    for (const target of [sel, then]) {
+      const o = document.createElement('option');
+      o.value = f.name; o.textContent = label;
+      o.disabled = !f.duration_ms;   // no length, no place in a playlist
+      target.appendChild(o);
+    }
   }
   say(`${files.length} file(s)`);
+  prefill();
 }
+
+// Start from what is on air, so editing a playlist is adding to it rather
+// than typing it out again. Once only, and never over your own queue.
+function prefill() {
+  if (prefilled || queue.length || !state || !state.schedule) return;
+  prefilled = true;
+  queue = state.schedule.items.map(i => ({name: i.file, duration_ms: i.duration_ms}));
+  $('loop').checked = !!state.schedule.loop;
+  if (state.schedule.then) $('then').value = state.schedule.then.file;
+  syncLoop();
+  renderQueue();
+}
+
+function renderQueue() {
+  const ol = $('queue');
+  ol.innerHTML = '';
+  queue.forEach((q, i) => {
+    const li = document.createElement('li');
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = `${q.name}  ${fmt(q.duration_ms / 1000)}`;
+    li.appendChild(name);
+    const mk = (label, title, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = label; b.title = title; b.onclick = fn;
+      li.appendChild(b);
+    };
+    mk('↑', 'move up', () => move(i, -1));
+    mk('↓', 'move down', () => move(i, 1));
+    mk('×', 'remove', () => { queue.splice(i, 1); renderQueue(); });
+    ol.appendChild(li);
+  });
+  const total = queue.reduce((a, q) => a + q.duration_ms, 0) / 1000;
+  $('total').innerHTML = queue.length
+    ? `<small>${queue.length} item(s), ${fmt(total)} in all</small>`
+    : '<small>Nothing queued.</small>';
+}
+
+function move(i, by) {
+  const j = i + by;
+  if (j < 0 || j >= queue.length) return;
+  const [item] = queue.splice(i, 1);
+  queue.splice(j, 0, item);
+  renderQueue();
+}
+
+$('add').onclick = () => {
+  const name = $('file').value;
+  const f = files.find(f => f.name === name);
+  if (!f) { say('Pick a file', true); return; }
+  if (!f.duration_ms) { say(`${name}: its length cannot be read, so it cannot be queued`, true); return; }
+  queue.push({name, duration_ms: f.duration_ms});
+  renderQueue();
+  say('');
+};
+
+// A list that repeats never reaches what follows it; the server refuses
+// the pair, so do not offer it.
+function syncLoop() { $('then').disabled = $('loop').checked; }
+$('loop').onchange = syncLoop;
 tokenEl.addEventListener('change', loadFiles);
 if (tokenEl.value) loadFiles();
 
 $('form').addEventListener('submit', async e => {
   e.preventDefault();
-  const file = $('file').value;
-  if (!file) { say('Pick a file', true); return; }
-  const body = {file, loop: $('loop').checked, start_ms: null};
+  if (!queue.length) { say('Queue something first', true); return; }
+  const body = {
+    files: queue.map(q => q.name),
+    loop: $('loop').checked,
+    then: $('loop').checked ? null : ($('then').value || null),
+    start_ms: null,
+  };
   if (document.querySelector('input[name=when]:checked').value === 'at') {
     const t = new Date($('at').value).getTime();
     if (isNaN(t)) { say('Pick a start time', true); return; }
     body.start_ms = t;
   }
   const r = await fetch('/api/schedule', {method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-  say(r.ok ? 'Scheduled' : `Refused: ${r.status} ${await r.text()}`, !r.ok);
+  say(r.ok ? `Scheduled ${queue.length} item(s)` : `Refused: ${r.status} ${await r.text()}`, !r.ok);
 });
 
 $('intermission').onclick = async () => {
@@ -118,13 +199,34 @@ function render() {
   if (!state) return;
   const s = state.schedule, im = state.intermission_since_ms;
   $('intermission').textContent = im ? `End intermission (${fmt((Date.now() + offset - im) / 1000)})` : 'Intermission';
-  let line = im ? `INTERMISSION, ${fmt((Date.now() + offset - im) / 1000)} so far\n` : '';
-  if (!s) { $('status').textContent = line + 'Nothing scheduled.'; return; }
-  const t = (Date.now() + offset - s.start_ms) / 1000;
+  let head = im ? `INTERMISSION, ${fmt((Date.now() + offset - im) / 1000)} so far\n` : '';
+  if (!s) { $('status').textContent = head + 'Nothing scheduled.'; return; }
   const when = new Date(s.start_ms).toLocaleString();
-  $('status').textContent = line + (t < 0
-    ? `${s.file}\nstarts at ${when} (in ${fmt(-t)})${s.loop ? ', looping' : ''}`
-    : `${s.file}\n${im ? 'paused at' : 'started ' + when + ','} ${fmt(im ? (im - s.start_ms) / 1000 : t)}${im ? ' in' : ' ago'}${s.loop ? ', looping' : ''}`);
+  const total = s.items.reduce((a, i) => a + i.duration_ms, 0) / 1000;
+  // Where the playlist is: at the paused moment during an intermission,
+  // otherwise now.
+  let t = ((im || Date.now() + offset) - s.start_ms) / 1000;
+  if (t < 0) {
+    $('status').textContent = head +
+      `${s.items.length} item(s), ${fmt(total)}\nstarts at ${when} (in ${fmt(-t)})`;
+    return;
+  }
+  let at = s.loop && total > 0 ? t % total : t, acc = 0, cur = -1, pos = 0;
+  for (let i = 0; i < s.items.length; i++) {
+    const d = s.items[i].duration_ms / 1000;
+    if (at < acc + d) { cur = i; pos = at - acc; break; }
+    acc += d;
+  }
+  const rows = s.items.map((it, i) =>
+    `${cur === i ? '▶' : ' '} ${i + 1}. ${it.file}  ${fmt(it.duration_ms / 1000)}` +
+    (cur === i ? `   at ${fmt(pos)}${im ? ' (paused)' : ''}` : ''));
+  if (s.then) {
+    rows.push(`${cur < 0 ? '▶' : ' '} then ${s.then.file} ↻  ${fmt(s.then.duration_ms / 1000)}`);
+  } else if (cur < 0) {
+    rows.push('  (played out)');
+  }
+  $('status').textContent = head + rows.join('\n') +
+    `\nstarted ${when}${s.loop ? ', looping the whole list' : ''}`;
 }
 setInterval(render, 500);
 
