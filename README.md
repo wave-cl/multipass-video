@@ -81,6 +81,26 @@ directory holds an `intermission.mp3` (or `.m4a`, `.ogg`, `.opus`,
 `.wav`, `.flac`), which is used instead after a restart. Viewers are never
 shown the file's name -- only the countdown, the picture, and the HUD.
 
+## A lighter rendition
+
+A file named `<stem>-720p.<ext>` beside another is offered as a lighter
+rendition of it, and a viewer takes it when it is a TV browser, or when
+it has starved twice. The server checks that it runs as long as the main
+file before offering it: a variant of a different length would put the
+viewers that took it somewhere else in the film. Build one with
+
+```bash
+WIDTH=1280 CRF=23 MAXRATE=2500k scripts/transcode film.mp4 film-720p.mp4
+```
+
+Why: measured on a Tizen 8 TV, a 6.3 Mb/s 1080p file took 6-9 s just to
+open and never held more than a second or two of buffer, so it starved,
+fell behind, got corrected, and starved again. Renditions are resolved
+when a playlist is scheduled and again when the server starts, so one
+that finishes transcoding later is picked up by re-scheduling (the admin
+page's **Keep the current start time** does that without disturbing what
+is playing) or by a restart.
+
 ## Browsers and sound
 
 A browser only starts sound on a page the viewer has clicked. The viewer

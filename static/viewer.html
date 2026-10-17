@@ -91,7 +91,15 @@ var schedule = null;      // {items, start_ms, loop, then} or null
 var intermission = null;  // when it began (server ms), or null
 var resumeAt = null;      // when the film starts again after one, or null
 var version = -1;
-var loadedFile = null;    // what the video element holds
+var loadedFile = null;    // the item the video element holds...
+var loadedSrc = null;     // ...and which rendition of it
+// A TV browser is taken as unable to hold a full-bitrate file: measured
+// on a Tizen 8 set, 6-9 s just to open a 4 GB file and a buffer that
+// never got past a second or two. Any other player that starves twice
+// joins it. The lighter rendition runs exactly as long, so the schedule
+// is untouched by the choice.
+var LIGHT_UA = /Tizen|SMART-TV|SmartTV|Web0S|NetCast|VIDAA|HbbTV/i.test(navigator.userAgent);
+var starvations = 0;
 var duration = NaN;       // of the loaded file, seconds, from the element
 var itemDur = NaN;        // ...and what the server says, which sets the boundary
 var itemLoops = false;    // whether this item is the one that repeats
@@ -261,22 +269,28 @@ video.addEventListener('loadedmetadata', function () { duration = video.duration
 // decoder's. What the controller has learned about the player -- its
 // stall, its rate verdict -- belongs to the player, not the file, so it
 // survives the change.
+function lightWanted(it) {
+  return !!(it.light && (LIGHT_UA || starvations >= STARVE_SWITCH));
+}
+
 function loadItem(it) {
-  trace('item ' + (it.idx >= 0 ? (it.idx + 1) : 'then') + ' ' + it.file +
-    ' at ' + it.pos.toFixed(2) + ' of ' + it.dur.toFixed(2) + (it.loops ? ' (loops)' : ''));
+  loadedSrc = lightWanted(it) ? it.light : it.file;
+  trace('item ' + (it.idx >= 0 ? (it.idx + 1) : 'then') + ' ' + loadedSrc +
+    ' at ' + it.pos.toFixed(2) + ' of ' + it.dur.toFixed(2) + (it.loops ? ' (loops)' : '') +
+    (loadedSrc !== it.file ? ' [lighter]' : ''));
   loadedFile = it.file; itemDur = it.dur; itemLoops = !!it.loops;
   duration = NaN; loadError = false; loadErrors = 0;
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   if (boundaryTimer) { clearTimeout(boundaryTimer); boundaryTimer = null; }
   resetTransient();
-  video.src = '/media/' + encodeURIComponent(it.file);
+  video.src = '/media/' + encodeURIComponent(loadedSrc);
   video.loop = !!it.loops;   // a repeating item wraps itself; we only correct
   video.load();
 }
 
 function unload() {
   if (!loadedFile) return;
-  loadedFile = null; itemDur = NaN; itemLoops = false; duration = NaN;
+  loadedFile = null; loadedSrc = null; itemDur = NaN; itemLoops = false; duration = NaN;
   video.removeAttribute('src');
   video.load();
 }
@@ -295,7 +309,7 @@ video.addEventListener('error', function () {
     if (!schedule) return;
     loadError = false; duration = NaN;
     resetController();
-    video.src = '/media/' + encodeURIComponent(loadedFile) + '?r=' + loadErrors;
+    video.src = '/media/' + encodeURIComponent(loadedSrc) + '?r=' + loadErrors;
     video.load();
   }, Math.min(30000, 2000 * Math.pow(2, loadErrors - 1)));
 });
@@ -406,7 +420,7 @@ function itemAt(t) {
     for (i = 0; i < items.length; i++) {
       d = items[i].duration_ms / 1000;
       if (t < acc + d) {
-        return {file: items[i].file, dur: d, pos: t - acc, idx: i,
+        return {file: items[i].file, light: items[i].light, dur: d, pos: t - acc, idx: i,
                 // Only a list of one can leave the wrapping to the element.
                 loops: !!schedule.loop && items.length === 1};
       }
@@ -415,7 +429,8 @@ function itemAt(t) {
   }
   if (schedule.then) {
     d = schedule.then.duration_ms / 1000;
-    return {file: schedule.then.file, dur: d, pos: ((t - total) % d + d) % d, idx: -1, loops: true};
+    return {file: schedule.then.file, light: schedule.then.light, dur: d,
+            pos: ((t - total) % d + d) % d, idx: -1, loops: true};
   }
   return null;
 }
@@ -490,7 +505,7 @@ var seeks = 0, holds = 0, lastDrift = 0, smooth = null, backoff = 0;
 // A seek costs this player a buffer and ~1.7 s of stall, so it is only
 // worth doing from a comfortable buffer. One hovering at a second or two
 // is about to starve again, and correcting it is what keeps it starving.
-var starved = false, STARVED_S = 4;
+var starved = false, STARVED_S = 4, STARVE_SWITCH = 2;
 var keyframeMode, lastSeekAt, seekTarget, seekIssuedAt, seekErr, seekLatency, stepping;
 var holding, playIssuedAt, playLatency, holdWorks, resumeTimer = null;
 var stall, settle;   // the clock's stall after a seek or resume, and the pending measurement of it
@@ -706,7 +721,16 @@ function correct(pos) {
   if (starving()) {
     if (!starved) {
       starved = true;
-      trace('starving: ' + bufferedAhead().toFixed(1) + 's ahead, rs=' + video.readyState + '; not correcting');
+      starvations++;
+      trace('starving: ' + bufferedAhead().toFixed(1) + 's ahead, rs=' + video.readyState +
+        '; not correcting (' + starvations + ')');
+      // Twice is a pattern, not a blip: take the lighter rendition from
+      // here on. Dropping what is loaded makes the next tick fetch it.
+      var it = target().item;
+      if (it && it.light && loadedSrc === it.file && starvations >= STARVE_SWITCH) {
+        trace('switching to the lighter rendition ' + it.light);
+        loadedFile = null;
+      }
     }
     if (rateValue !== 1) setRate(1);
     return;
@@ -847,7 +871,8 @@ function tick() {
         '  rate ' + rateValue.toFixed(2) + (rateWorks === null ? ' ?' : rateWorks ? ' ok' : ' ignored') +
         '  seeks ' + seeks + ' holds ' + holds + (isNaN(seekErr) ? '' : ' landed ' + ms(seekErr) + ' off, ' + (seekLatency * 1000).toFixed(0) + 'ms late, stall ' + (stall * 1000).toFixed(0) + 'ms') +
         (keyframeMode ? '  keyframe player' : '') + (holdWorks === false ? '  no holds' : '') +
-        (backoff ? '  backoff ' + backoff : '') + (starved ? '  STARVING' : '') + '\n';
+        (backoff ? '  backoff ' + backoff : '') + (starved ? '  STARVING' : '') +
+        (loadedSrc && loadedSrc !== loadedFile ? '  lighter' : '') + '\n';
       break;
   }
   $('unmute').classList.toggle('hidden', !((t.state === 'playing' && video.muted ||

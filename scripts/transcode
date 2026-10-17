@@ -3,6 +3,13 @@
 #
 #   scripts/transcode input.mkv output.mp4
 #   PRESET=medium scripts/transcode input.mkv output.mp4   # about twice as fast
+#   WIDTH=1280 CRF=23 MAXRATE=2500k scripts/transcode in.mp4 out-720p.mp4
+#
+# WIDTH caps the width (default 1920), MAXRATE the bitrate (default 8M,
+# buffer twice that), CRF the quality (default 20, higher is smaller). A
+# lighter rendition for a player that cannot hold the full one is
+# WIDTH=1280 CRF=23 MAXRATE=2500k -- same duration, so it shares the
+# schedule's timeline exactly.
 #
 # - H.264 High profile, level 4.1, yuv420p, at most 1080p: what every
 #   browser and every TV decodes in hardware.
@@ -35,10 +42,10 @@ echo "audio: $channels channel(s) -> $audio"
 # shellcheck disable=SC2086  # $audio is a deliberate word list
 ffmpeg -hide_banner -nostdin -y -i "$in" \
   -map 0:v:0 -map '0:a:0?' -sn -dn \
-  -vf "scale='min(1920,iw)':-2" \
-  -c:v libx264 -preset "${PRESET:-slow}" -crf 20 -profile:v high -level 4.1 -pix_fmt yuv420p \
+  -vf "scale='min(${WIDTH:-1920},iw)':-2" \
+  -c:v libx264 -preset "${PRESET:-slow}" -crf "${CRF:-20}" -profile:v high -level 4.1 -pix_fmt yuv420p \
   -force_key_frames 'expr:gte(t,n_forced*2)' -sc_threshold 0 -x264-params open-gop=0 \
-  -maxrate 8M -bufsize 16M \
+  -maxrate "${MAXRATE:-8M}" -bufsize "${BUFSIZE:-16M}" \
   $audio \
   -movflags +faststart \
   "$out"

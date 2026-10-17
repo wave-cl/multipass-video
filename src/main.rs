@@ -90,6 +90,12 @@ struct Args {
 struct Item {
     file: String,
     duration_ms: i64,
+    /// A lighter rendition sitting beside it, named `<stem>-720p.<ext>`,
+    /// for a player that cannot hold the main file's bitrate. It must run
+    /// exactly as long, because it shares this item's place in the
+    /// timeline; one that does not is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    light: Option<String>,
 }
 
 /// What is scheduled: a playlist played in order from `start_ms`, which is
@@ -332,6 +338,29 @@ fn probe_duration_ms(path: &Path) -> Option<i64> {
     ffprobe_duration_ms(path)
 }
 
+/// The lighter rendition beside a file, if there is one and it runs as
+/// long. A variant of a different length would put the viewers that take
+/// it somewhere else in the film, so it is refused loudly rather than
+/// quietly desyncing them.
+fn light_variant(media_dir: &Path, name: &str, duration_ms: i64) -> Option<String> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    let candidate = format!("{stem}-720p.{ext}");
+    if !media_dir.join(&candidate).is_file() {
+        return None;
+    }
+    match probe_duration_ms(&media_dir.join(&candidate)) {
+        Some(d) if (d - duration_ms).abs() <= 1000 => {
+            info!("{name}: lighter rendition {candidate}");
+            Some(candidate)
+        }
+        Some(d) => {
+            warn!("{candidate} runs {d} ms against {name}'s {duration_ms} ms; ignoring it");
+            None
+        }
+        None => None,
+    }
+}
+
 /// Check a name and read its duration, or say which of the two failed.
 fn item_for(media_dir: &Path, name: &str) -> Result<Item, (StatusCode, String)> {
     if !valid_file_name(name) || !playable(name) {
@@ -349,6 +378,7 @@ fn item_for(media_dir: &Path, name: &str) -> Result<Item, (StatusCode, String)> 
     }
     match probe_duration_ms(&path) {
         Some(duration_ms) => Ok(Item {
+            light: light_variant(media_dir, name, duration_ms),
             file: name.to_string(),
             duration_ms,
         }),
@@ -451,6 +481,14 @@ fn load_state(path: &Path, media_dir: &Path) -> Persisted {
                     state.schedule = None;
                 }
             }
+        }
+    }
+    // Renditions appear beside their files later than the schedule that
+    // names them -- a transcode finishes while something is playing -- so
+    // resolve them again here rather than trusting what was stored.
+    if let Some(sch) = &mut state.schedule {
+        for item in sch.items.iter_mut().chain(sch.then.iter_mut()) {
+            item.light = light_variant(media_dir, &item.file, item.duration_ms);
         }
     }
     state
@@ -1162,6 +1200,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lighter_rendition_is_offered_only_if_it_runs_as_long() {
+        use http_body_util::BodyExt;
+        let dir = test_dir("light");
+        let app = test_app_in(&dir, None);
+        std::fs::write(dir.join("film.mp4"), fake_mp4(600_000)).unwrap();
+        async fn light_now(app: &Router) -> serde_json::Value {
+            use tower::ServiceExt;
+            let req = Request::post("/api/schedule")
+                .header(header::AUTHORIZATION, "Bearer admin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(r#"{"files":["film.mp4"]}"#))
+                .unwrap();
+            app.clone().oneshot(req).await.unwrap();
+            let res = app.clone().oneshot(get("/api/state")).await.unwrap();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["schedule"]["items"][0]
+                ["light"]
+                .clone()
+        }
+
+        // Nothing beside it: nothing offered.
+        assert!(light_now(&app).await.is_null());
+
+        // One that runs as long: offered.
+        std::fs::write(dir.join("film-720p.mp4"), fake_mp4(600_000)).unwrap();
+        assert_eq!(light_now(&app).await, "film-720p.mp4");
+
+        // One that does not: refused, because a viewer taking it would be
+        // somewhere else in the film from everyone else.
+        std::fs::write(dir.join("film-720p.mp4"), fake_mp4(590_000)).unwrap();
+        assert!(light_now(&app).await.is_null());
+    }
+
+    #[tokio::test]
     async fn starting_now_means_after_the_countdown() {
         use http_body_util::BodyExt;
         let dir = test_dir("countdown");
@@ -1222,7 +1294,8 @@ mod tests {
             sch.items,
             vec![Item {
                 file: "old.mp4".into(),
-                duration_ms: 123_000
+                duration_ms: 123_000,
+                light: None
             }]
         );
         assert_eq!(sch.start_ms, 1000);
@@ -1358,6 +1431,7 @@ mod tests {
             items: vec![Item {
                 file: "a.mp4".into(),
                 duration_ms: 20_000,
+                light: None,
             }],
             start_ms: 5,
             loop_: true,
